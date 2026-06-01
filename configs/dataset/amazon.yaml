@@ -45,11 +45,11 @@ TIGER:
 
   trainer:
     steps: 200000
-    lr: 0.0003
+    lr: 0.001
     patience: 50
     scheduler: "cosine"
     warmup_steps: 10000
     weight_decay: 0.035
-    batch_size: 256
+    batch_size: 1024
     eval_batch_size: 32
     eval_frequence: 10
