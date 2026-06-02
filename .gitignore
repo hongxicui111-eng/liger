@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Model checkpoints and logs
+checkpoints/
+logs/
+outputs/
+wandb/
+
+# Data files (large)
+*.pkl
+*.pickle
+*.h5
+*.hdf5
+
+# Jupyter
+.ipynb_checkpoints/
+
+# MyFlicker / CodeFlicker
+.codeflicker/
+
+# Misc
+*.log
+*.tmp
