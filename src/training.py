@@ -716,7 +716,7 @@ def train_epoch(
     # Initialize accumulators so they are defined even if all batches are skipped
     loss = torch.tensor(0.0, device=device)
     hard_loss = 0.0
-    mse_loss_val = torch.tensor(0.0, device=device)
+    codebook_loss_val = torch.tensor(0.0, device=device)
     grad_norm = 0.0
     first_failure_log = {}
     embedding_loss = 0.0
@@ -1317,11 +1317,14 @@ def train_epoch_residual(
     # Initialize accumulators so they are defined even if all batches are skipped
     loss = torch.tensor(0.0, device=device)
     hard_loss = 0.0
-    mse_loss_val = torch.tensor(0.0, device=device)
+    codebook_loss_val = torch.tensor(0.0, device=device)
     grad_norm = 0.0
     first_failure_log = {}
     embedding_loss = 0.0
     num_valid_batches = 0
+    # Non-TF statistics accumulators
+    nontf_resid_pct_sum = 0.0
+    nontf_ntp_pct_sum = 0.0
 
     for batch in tqdm(train_dataloader):
         optimizer.zero_grad()
@@ -1336,22 +1339,27 @@ def train_epoch_residual(
 
         # Extract losses from residual forward
         hard_loss = outputs["sid_loss"]
-        mse_loss_val = outputs["mse_loss"]
+        codebook_loss_val = outputs["codebook_loss"]
+        cumulative_residual_loss_val = outputs.get("cumulative_residual_loss", 0.0)
+
+        # Accumulate non-TF statistics
+        nontf_resid_pct_sum += outputs.get("nontf_resid_pct", 0.0)
+        nontf_ntp_pct_sum += outputs.get("nontf_ntp_pct", 0.0)
 
         logits = outputs["logits"]  # [B, n_codebook, V]
 
-        print(logits)
+        # print(logits)
         # ── NaN 诊断：精确定位 NaN 来源 ──
         logits_has_nan = torch.isnan(logits).any().item()
         logits_has_inf = torch.isinf(logits).any().item()
         sid_loss_is_nan = torch.isnan(outputs["loss"]).item() if isinstance(outputs["loss"], torch.Tensor) else False
-        mse_loss_is_nan = torch.isnan(mse_loss_val).item() if isinstance(mse_loss_val, torch.Tensor) else False
+        codebook_loss_is_nan = torch.isnan(codebook_loss_val).item() if isinstance(codebook_loss_val, torch.Tensor) else False
 
-        if logits_has_nan or logits_has_inf or sid_loss_is_nan or mse_loss_is_nan:
+        if logits_has_nan or logits_has_inf or sid_loss_is_nan or codebook_loss_is_nan:
             print(f"\n[NaN 诊断] epoch={epoch}")
             print(f"  forward_residual outputs['loss'] NaN? {sid_loss_is_nan}")
             print(f"  forward_residual sid_loss  NaN? {torch.isnan(hard_loss).item() if isinstance(hard_loss, torch.Tensor) else 'scalar'}")
-            print(f"  forward_residual mse_loss NaN? {mse_loss_is_nan}")
+            print(f"  forward_residual codebook_loss NaN? {codebook_loss_is_nan}")
             print(f"  logits NaN? {logits_has_nan}  logits inf? {logits_has_inf}")
             if logits_has_nan:
                 nan_count = torch.isnan(logits).sum().item()
@@ -1363,26 +1371,10 @@ def train_epoch_residual(
             print(f"  → 跳过此 batch")
             continue
 
-        # Apply first_failure_weighted_loss on NTP logits (cast to FP32 for stability)
-        hard_loss_weighted, first_failure_log = first_failure_weighted_loss(
-            logits.float(), batch["labels_sids"].to(device)
-        )
-
-        # NaN check after loss computation
-        if torch.isnan(hard_loss_weighted):
-            # 先用原始 FP16 logits 试一下，看是不是 FP16 精度问题
-            hard_loss_fp16, _ = first_failure_weighted_loss(
-                logits, batch["labels_sids"].to(device)
-            )
-            print(f"\n[NaN 诊断] epoch={epoch}")
-            print(f"  logits FP16 → loss NaN? {torch.isnan(hard_loss_fp16).item()}")
-            print(f"  logits FP32 → loss NaN? {torch.isnan(hard_loss_weighted).item()}")
-            print(f"  ⚠️ NaN 来自 first_failure_weighted_loss (FP16 精度问题)")
-            print(f"  → 跳过此 batch")
-            continue
-
-        loss = hard_loss_weighted * method_config["sid_loss_weight"]
-        loss += mse_loss_val * method_config.get("mse_loss_weight", 1.0)
+        # Use standard CE loss from forward_residual (no first_failure_weighted_loss)
+        loss = hard_loss * method_config["sid_loss_weight"]
+        loss += codebook_loss_val * method_config.get("codebook_loss_weight", 1.0)
+        loss += cumulative_residual_loss_val * method_config.get("cumulative_residual_loss_weight", 0.0)
         num_valid_batches += 1
 
         embedding_loss = 0
@@ -1414,17 +1406,22 @@ def train_epoch_residual(
     if num_valid_batches == 0:
         print(f"⚠️ No valid batches in epoch {epoch + 1} — all batches were skipped due to NaN/inf")
 
+    # Compute average non-TF percentages over the epoch
+    nontf_resid_pct_avg = nontf_resid_pct_sum / num_valid_batches if num_valid_batches > 0 else 0.0
+    nontf_ntp_pct_avg = nontf_ntp_pct_sum / num_valid_batches if num_valid_batches > 0 else 0.0
+
     logs = {
         "train/loss": loss.item() if isinstance(loss, torch.Tensor) else loss,
         "train/epoch": epoch + 1,
         "train/lr": get_lr(optimizer),
         "train/grad_norm": grad_norm,
         "train/sid_loss": hard_loss if isinstance(hard_loss, float) else hard_loss.item(),
-        "train/mse_loss": mse_loss_val.item() if isinstance(mse_loss_val, torch.Tensor) else mse_loss_val,
+        "train/codebook_loss": codebook_loss_val.item() if isinstance(codebook_loss_val, torch.Tensor) else codebook_loss_val,
+        "train/cumulative_residual_loss": cumulative_residual_loss_val if isinstance(cumulative_residual_loss_val, float) else cumulative_residual_loss_val,
         "train/embedding_loss": embedding_loss,
+        "train/nontf_resid_pct": nontf_resid_pct_avg,
+        "train/nontf_ntp_pct": nontf_ntp_pct_avg,
     }
-    for k, v in first_failure_log.items():
-        logs[f"train/{k}"] = v
     writer.log(logs)
 
     return model
@@ -1517,6 +1514,7 @@ def train_tiger_residual(
     unseen_semantic_ids = torch.from_numpy(unseen_semantic_ids)
 
     last_codebook_size = max(max_last_semantic_ids, codebook_size)
+    flag_separate_bos_representation = method_config.get("flag_separate_bos_representation", False)
     if method_config["include_user_id"]:
         this_vocab_size = (
             2000 + codebook_size * n_semantic_codebook + last_codebook_size + 2
@@ -1524,8 +1522,16 @@ def train_tiger_residual(
     else:
         this_vocab_size = codebook_size * n_semantic_codebook + last_codebook_size + 2
 
+    # When separating BOS representation from SID generation, we need an extra
+    # special token (SID_START) to trigger SID generation. Add 1 to vocab size.
+    if flag_separate_bos_representation:
+        this_vocab_size += 1
+
     if method_config["use_id"] == "item_id":
         this_vocab_size = item_embedding.shape[0] + 2
+
+    # SID_START token: placed just before EOS in the vocabulary
+    sid_start_token_id = this_vocab_size - 2 if flag_separate_bos_representation else None
 
     t5_config = config["T5"]
     trainer_config = config["trainer"]
@@ -1563,10 +1569,16 @@ def train_tiger_residual(
         )
 
     # Residual-specific config
-    mse_loss_weight = method_config.get("mse_loss_weight", 1.0)
+    codebook_loss_weight = method_config.get("codebook_loss_weight", 1.0)
     num_residual_levels = method_config.get(
         "num_residual_levels", n_semantic_codebook - 1
     )
+    soft_label_K = method_config.get("soft_label_K", 0)
+    soft_label_temperature = method_config.get("soft_label_temperature", 1.0)
+    cumulative_residual_loss_weight = method_config.get("cumulative_residual_loss_weight", 0.0)
+    cumulative_residual_loss_type = method_config.get("cumulative_residual_loss_type", "mse")
+    resid_nontf_ratio = method_config.get("resid_nontf_ratio", 0.0)
+    ntp_nontf_ratio = method_config.get("ntp_nontf_ratio", 0.0)
 
     model = TIGER_Residual(
         config=model_config,
@@ -1578,8 +1590,16 @@ def train_tiger_residual(
         rqvae_codebook_weights=rqvae_codebook_weights,
         codebook_size=codebook_size,
         latent_size=latent_size,
-        mse_loss_weight=mse_loss_weight,
+        codebook_loss_weight=codebook_loss_weight,
         num_residual_levels=num_residual_levels,
+        soft_label_K=soft_label_K,
+        soft_label_temperature=soft_label_temperature,
+        cumulative_residual_loss_weight=cumulative_residual_loss_weight,
+        cumulative_residual_loss_type=cumulative_residual_loss_type,
+        resid_nontf_ratio=resid_nontf_ratio,
+        ntp_nontf_ratio=ntp_nontf_ratio,
+        flag_separate_bos_representation=flag_separate_bos_representation,
+        sid_start_token_id=sid_start_token_id,
     ).to(device)
 
     total_steps = trainer_config["steps"]
@@ -1761,11 +1781,23 @@ def train_tiger_residual(
         rqvae_codebook_weights=rqvae_codebook_weights,
         codebook_size=codebook_size,
         latent_size=latent_size,
-        mse_loss_weight=mse_loss_weight,
+        codebook_loss_weight=codebook_loss_weight,
         num_residual_levels=num_residual_levels,
+        soft_label_K=soft_label_K,
+        soft_label_temperature=soft_label_temperature,
+        cumulative_residual_loss_weight=cumulative_residual_loss_weight,
+        cumulative_residual_loss_type=cumulative_residual_loss_type,
+        resid_nontf_ratio=resid_nontf_ratio,
+        ntp_nontf_ratio=ntp_nontf_ratio,
+        flag_separate_bos_representation=flag_separate_bos_representation,
+        sid_start_token_id=sid_start_token_id,
     ).to(device)
 
     model.load_state_dict(torch.load(best_state_path), strict=False)
+
+    # Disable non-TF for evaluation (use full teacher forcing context)
+    model.resid_nontf_ratio = 0.0
+    model.ntp_nontf_ratio = 0.0
 
     logs, _ = evaluate_helper_residual(
         model,

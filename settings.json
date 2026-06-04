@@ -1,0 +1,11 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://10.82.120.233:8000/v1",
+    "ANTHROPIC_AUTH_TOKEN": "dummy",
+    "ANTHROPIC_API_KEY": "dummy",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "/share/cuihongxi/Qwen3.5-397B-A17B",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "/share/cuihongxi/Qwen3.5-397B-A17B",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "/share/cuihongxi/Qwen3.5-397B-A17B",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  }
+}

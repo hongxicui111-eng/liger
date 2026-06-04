@@ -193,9 +193,17 @@ def calculate_metrics(outputs, labels, KEYS, codebook_level=4, lift_constraint=F
 
     if not lift_constraint:
         for i in range(batch_size):
-            assert (
-                torch.unique(outputs[i], dim=0).shape[0] == outputs.shape[1]
-            ), "Unless something is wrong, beam search should not return non-unique outputs."
+            n_unique = torch.unique(outputs[i], dim=0).shape[0]
+            n_expected = outputs.shape[1]
+            if n_unique < n_expected:
+                import logging
+                logging.warning(
+                    f"Beam search returned {n_unique} unique sequences out of "
+                    f"{n_expected} requested for batch item {i}. "
+                    f"This can happen when beam search converges or when "
+                    f"residual beam pruning doesn't find enough diverse candidates. "
+                    f"Metrics at K > {n_unique} may be inaccurate."
+                )
 
     matches = (outputs == labels[:, None, :codebook_level]).all(axis=-1)
     for key in KEYS:
@@ -658,12 +666,18 @@ def evaluate_residual(
         batch_size, n_codebook = labels.shape[0], labels.shape[1]
 
         num_return_sequences = max(RETRIEVE_KEY)
+        resid_beams = method_config.get("resid_beams", None)
+        resid_score_weight = method_config.get("resid_score_weight", 1.0)
+        resid_beam_mode = method_config.get("resid_beam_mode", "pruning")
         with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
             outputs = model.generate_residual(
                 **input_kwargs,
                 max_new_tokens=n_codebook,
                 num_beams=num_return_sequences,
                 num_return_sequences=num_return_sequences,
+                resid_beams=resid_beams,
+                resid_score_weight=resid_score_weight,
+                resid_beam_mode=resid_beam_mode,
             )
         predicted_embedding = model.predicted_embedding
 

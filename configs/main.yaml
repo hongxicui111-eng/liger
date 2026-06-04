@@ -9,3 +9,4 @@ seed: 0
 device_id: 0
 output_path: None
 test_method: tiger
+checkpoint_path: null   # Path to model checkpoint for test_only.py. null = auto-detect from output_path/results/ckpt_best.pt

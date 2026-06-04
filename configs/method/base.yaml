@@ -9,8 +9,22 @@ embedding_loss_weight: 0
 sid_loss_weight: 1
 
 use_residual_decoder: False
-mse_loss_weight: 1.0
+codebook_loss_weight: 1.0
 num_residual_levels: null
+soft_label_K: 0          # 0 = hard label (original CE); >0 = soft-label top-K nearest codebook entries
+soft_label_temperature: 1.0  # temperature for softmax on -dist; higher = more uniform, lower = sharper
+cumulative_residual_loss_weight: 0.0    # 0=disabled; >0 adds MSE constraint: residual output ≈ sum of remaining codes
+cumulative_residual_loss_type: "mse"    # "mse" for L2 regression, "cosine" for cosine similarity loss
+resid_beams: null                       # null=same as num_beams; 1=greedy pass-through (original)
+resid_score_weight: 1.0                 # weight for codebook logits when combining with beam scores at residual positions
+resid_beam_mode: "pruning"              # "pruning" (default): at most 1 candidate per parent beam → unique SID prefixes;
+                                        # "expansion": all n_beams × codebook_size compete, multiple from same parent allowed
+resid_nontf_ratio: 0.0                 # probability of using predicted sid_k (not GT) for codebook index at each residual step
+ntp_nontf_ratio: 0.0                   # probability of using predicted sid_{k-1} (not GT) as NTP decoder input (more aggressive)
+
+flag_separate_bos_representation: False  # if True, <BOS> only builds object representation (no SID decoding),
+                                          # and a separate <SID_START> token triggers sid_0 generation.
+                                          # This decouples "understanding" from "generating" in the decoder.
 
 evaluation_method: "default"
 
