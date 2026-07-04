@@ -967,13 +967,17 @@ def main():
     dataset_dict["RQ-VAE"]["input_dim"] = vec_dim
 
     # Load sequence files (tab-separated: uid\titem1\titem2...)
+    # For training we only need "all"; normal/surprise are not used during training.
     print("Loading sequence files...")
     train_sequences = {}
     train_uids = {}
-    for cat, fname in dataset_dict["train_files"].items():
-        seqs, uids = load_sequence_file(os.path.join(data_dir, fname))
-        train_sequences[f"train_{cat}"] = seqs
-        train_uids[f"train_{cat}"] = uids
+    train_all_fname = dataset_dict["train_files"].get("all")
+    if train_all_fname:
+        seqs, uids = load_sequence_file(os.path.join(data_dir, train_all_fname))
+        train_sequences["train_all"] = seqs
+        train_uids["train_all"] = uids
+    else:
+        raise ValueError("train_files must contain an 'all' key in the dataset config.")
 
     val_sequences = {}
     val_uids = {}
