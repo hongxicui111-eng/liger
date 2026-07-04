@@ -1,0 +1,90 @@
+# Custom dataset configuration for pre-split data with semantic vectors.
+# This bypasses the Amazon/Steam download and preprocessing pipeline.
+# Data files are already split into train/val/test with 3 variants each.
+#
+# Workflow:
+#   1. build_embedding.py  →  item_embedding.pt  (external pre-processing)
+#   2. build_custom_sid.py  →  custom_semantic_0.pkl + codebook weights
+#   3. run_custom.py        →  TIGER training + evaluation
+
+type: Custom
+name: Custom            # placeholder name, set via command line if needed
+data_dir: ./data/custom/  # directory containing the split files
+embedding_file: item_embedding.pt  # .pt file from build_embedding.py
+
+# Pre-split data files (relative to data_dir)
+# Format per line: uid\titem1\titem2\t...\titemN  (tab-separated)
+train_files:
+  all: train_all.txt
+  normal: train_normal.txt
+  surprise: train_surprise.txt
+val_files:
+  all: val_all.txt
+  normal: val_normal.txt
+  surprise: val_surprise.txt
+test_files:
+  all: test_all.txt
+  normal: test_normal.txt
+  surprise: test_surprise.txt
+
+# Sequence config
+max_items_per_seq: 200   # max items per user sequence (for padding/truncation)
+
+# RQ-VAE config for SID construction from semantic vectors
+# IMPORTANT: Scale hidden_dim and latent_dim with your embedding dimension:
+#   - embedding_dim=768 → hidden=[768,512,256], latent=128  (original)
+#   - embedding_dim=256 → hidden=[256,128,64],  latent=64
+#   - embedding_dim=64  → hidden=[256,128,64],  latent=32
+RQ-VAE:
+  optimizer: AdamW
+  weight_decay: 0.1
+  batch_size: 2048
+  epochs: 8000
+  lr: 0.001
+  beta: 0.25
+  input_dim: null        # auto-detected from embedding tensor
+  hidden_dim:
+    - 256
+    - 128
+    - 64
+  latent_dim: 32
+  num_layers: 3
+  dropout: 0.1
+  code_book_size: 256
+  max_seq_len: 256
+  val_ratio: 0.05
+  num_workers: 4
+
+# TIGER model config
+# d_model, d_ff, num_heads, d_kv are T5 transformer architecture params.
+# These are independent of embedding dim — they define the transformer's
+# internal representation size. For 64-dim embeddings you can keep these
+# as-is (the SID vocabulary is the transformer's input, not raw embeddings),
+# or scale down for a smaller model if data is limited.
+TIGER:
+  n_positions: 801  # 200 items × 4 SID levels + 1 eos = 801
+  save_every_n_epochs: 10
+  T5:
+    encoder_layers: 6
+    decoder_layers: 6
+    d_model: 128
+    d_ff: 1024
+    num_heads: 6
+    d_kv: 64
+    dropout_rate: 0.2
+    feed_forward_proj: "relu"
+    initializer_factor: 0.02
+
+  trainer:
+    steps: 200000
+    lr: 0.001
+    patience: 50
+    scheduler: "cosine"
+    warmup_steps: 10000
+    weight_decay: 0.035
+    batch_size: 1024
+    eval_batch_size: 32
+    eval_frequence: 10
+
+# Evaluation metrics: Recall, NDCG @ [5, 10, 20, 100]
+eval_keys: [5, 10, 20, 100]
