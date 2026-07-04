@@ -16,12 +16,13 @@ Sequence file format: each line is tab-separated:
 """
 
 import json
+import multiprocessing as mp
 import os
 import pickle
 
 import numpy as np
 import torch
-from tqdm import trange
+from tqdm import tqdm, trange
 
 from .load_data import (
     expand_id,
@@ -185,31 +186,19 @@ def generate_input_sequence_custom(
     include_user_id=False,
     user_id_offset=None,
 ):
-    """Generate input sequences from pre-split data.
-
-    Each sequence is a list of item IDs where the last item is the target
-    and everything before it is the context.
-
-    Args:
-        user_sequence: list of item IDs (the full sequence for one example)
-        item_2_semantic_id: dict mapping item_id -> tuple of semantic IDs
-        max_items_per_seq: max number of items in a sequence
-        max_sequence_length: max total sequence length (items × codebook_depth)
-        codebook_sizes: list of codebook sizes per level
-        item_embedding: [n_item, dim] tensor
-        include_user_id: whether to prepend user ID
-        user_id_offset: offset for user ID tokens
+    """Generate input sequences from pre-split data (single-sequence, kept for
+    backward compatibility).  New code should prefer build_dataset_from_sequences
+    which calls the vectorised batch path internally.
     """
     # Truncate: keep at most max_items_per_seq history items + the last target item.
-    # user_sequence[-1] is always the target; history = user_sequence[:-1]
     history = user_sequence[:-1]
     target = user_sequence[-1:]
     if len(history) > max_items_per_seq:
-        history = history[-max_items_per_seq:]  # keep the most recent items
+        history = history[-max_items_per_seq:]
     user_sequence = history + target
 
     if include_user_id and user_id_offset is not None:
-        user_id = user_id_offset  # simplified: no per-user hashing for custom data
+        user_id = user_id_offset
         input_sids = [user_id]
         attention_mask_sids = [1]
         input_ids = [user_id]
@@ -221,7 +210,6 @@ def generate_input_sequence_custom(
 
     for i in range(len(user_sequence)):
         if i == len(user_sequence) - 1:
-            # Last item is the target/label
             labels_sids.extend(
                 expand_id(item_2_semantic_id[user_sequence[i]], codebook_sizes)
             )
@@ -229,7 +217,6 @@ def generate_input_sequence_custom(
             labels_ids.append(user_sequence[i])
             label_embeddings = this_item_embedding
         else:
-            # Input items
             input_semantic_ids = expand_id(
                 item_2_semantic_id[user_sequence[i]], codebook_sizes
             )
@@ -256,10 +243,7 @@ def generate_input_sequence_custom(
         pad_sequence(attention_mask_ids, max_sequence_length, pad_token=0)
     )
 
-    # Pad input_embeddings to max_items_per_seq
     if len(input_embeddings) == 0:
-        # Edge case: sequence of length 1 (no input, only target)
-        # This shouldn't happen in practice since we filter len >= 2
         input_embeddings = torch.zeros(1, item_embedding.shape[1])
     else:
         padding_count = max_items_per_seq - len(input_embeddings)
@@ -281,6 +265,92 @@ def generate_input_sequence_custom(
     )
 
 
+# ---------------------------------------------------------------------------
+# Vectorised batch builder (fast path)
+# ---------------------------------------------------------------------------
+
+def _build_chunk(args):
+    """Worker function for multiprocessing — processes a chunk of sequences.
+
+    All heavy objects are passed as plain Python/numpy objects so they can be
+    pickled safely across process boundaries (no GPU tensors here).
+
+    Returns numpy arrays for each field (no torch tensors — caller converts).
+    """
+    (
+        sequences_chunk,
+        sid_array,          # np.ndarray [n_items+1, n_levels], row 0 unused (pad)
+        emb_np,             # np.ndarray [n_items, emb_dim], CPU, 0-indexed
+        max_items_per_seq,
+        max_sequence_length,
+        n_levels,
+        include_user_id,
+        user_id_offset,
+    ) = args
+
+    N = len(sequences_chunk)
+    emb_dim = emb_np.shape[1]
+
+    # Pre-allocate output arrays
+    out_input_sids        = np.zeros((N, max_sequence_length), dtype=np.int64)
+    out_attn_sids         = np.zeros((N, max_sequence_length), dtype=np.int64)
+    out_input_ids         = np.zeros((N, max_sequence_length), dtype=np.int64)
+    out_attn_ids          = np.zeros((N, max_sequence_length), dtype=np.int64)
+    out_labels_sids       = np.zeros((N, n_levels),            dtype=np.int64)
+    out_labels_ids        = np.zeros((N,),                     dtype=np.int64)
+    out_input_embeddings  = np.zeros((N, max_items_per_seq, emb_dim), dtype=np.float32)
+    out_label_embeddings  = np.zeros((N, emb_dim),             dtype=np.float32)
+
+    for i, seq in enumerate(sequences_chunk):
+        # --- truncate ---
+        history = seq[:-1]
+        target_item = seq[-1]
+        if len(history) > max_items_per_seq:
+            history = history[-max_items_per_seq:]
+
+        # --- user-id prefix ---
+        sid_prefix_len = 0
+        id_prefix_len  = 0
+        if include_user_id and user_id_offset is not None:
+            out_input_sids[i, 0] = user_id_offset
+            out_attn_sids [i, 0] = 1
+            out_input_ids [i, 0] = user_id_offset
+            out_attn_ids  [i, 0] = 1
+            sid_prefix_len = 1
+            id_prefix_len  = 1
+
+        # --- history items ---
+        n_hist = len(history)
+        sid_pos = sid_prefix_len
+        for j, item_id in enumerate(history):
+            sids = sid_array[item_id]          # shape [n_levels]
+            out_input_sids[i, sid_pos : sid_pos + n_levels] = sids
+            out_attn_sids [i, sid_pos : sid_pos + n_levels] = 1
+            sid_pos += n_levels
+
+            out_input_ids[i, id_prefix_len + j] = item_id
+            out_attn_ids [i, id_prefix_len + j] = 1
+
+            # embedding (item_id is 1-indexed, emb_np is 0-indexed)
+            out_input_embeddings[i, j] = emb_np[item_id - 1]
+
+        # --- target item ---
+        out_labels_sids[i]      = sid_array[target_item]
+        out_labels_ids[i]       = target_item
+        out_label_embeddings[i] = emb_np[target_item - 1]
+
+    return (
+        out_input_sids,
+        out_attn_sids,
+        out_input_ids,
+        out_attn_ids,
+        out_labels_sids,
+        out_labels_ids,
+        out_input_embeddings,
+        out_label_embeddings,
+    )
+
+
 def build_dataset_from_sequences(
     sequences,
     item_2_semantic_id,
@@ -290,69 +360,124 @@ def build_dataset_from_sequences(
     max_sequence_length,
     user_id_offset,
     codebook_sizes,
+    num_workers: int = 0,
 ):
-    """Build a dataset dict from a list of sequences.
+    """Build a dataset dict from a list of sequences — vectorised + parallel.
 
-    Each sequence in the list is already a complete training example:
-    all items except the last are input, the last is the target.
+    Args:
+        sequences: list of item-ID lists (each sequence ends with the target)
+        item_2_semantic_id: dict item_id -> tuple of raw SID indices
+        item_embedding: torch.Tensor [n_items, emb_dim] (CPU or GPU)
+        method_config: method configuration dict
+        max_items_per_seq: max history length (truncate from the left)
+        max_sequence_length: padded SID sequence length
+        user_id_offset: token offset for user-id prepend
+        codebook_sizes: int or list[int]
+        num_workers: parallel worker processes (0 = auto = cpu_count // 2)
 
-    Returns a dict suitable for CustomDataset.
+    Returns a dict of torch tensors suitable for CustomDataset.
     """
-    data = {
-        "input_ids": [],
-        "attention_mask_ids": [],
-        "labels_ids": [],
-        "input_embeddings": [],
-        "label_embeddings": [],
-        "input_sids": [],
-        "labels_sids": [],
-        "attention_mask_sids": [],
-    }
+    N = len(sequences)
+    if N == 0:
+        emb_dim = item_embedding.shape[1]
+        return {
+            "input_sids":        torch.zeros(0, max_sequence_length, dtype=torch.long),
+            "attention_mask_sids": torch.zeros(0, max_sequence_length, dtype=torch.long),
+            "input_ids":         torch.zeros(0, max_sequence_length, dtype=torch.long),
+            "attention_mask_ids": torch.zeros(0, max_sequence_length, dtype=torch.long),
+            "labels_sids":       torch.zeros(0, dtype=torch.long),
+            "labels_ids":        torch.zeros(0, dtype=torch.long),
+            "input_embeddings":  torch.zeros(0, max_items_per_seq, emb_dim),
+            "label_embeddings":  torch.zeros(0, emb_dim),
+        }
 
-    for seq in trange(len(sequences), desc="Building dataset"):
+    include_user_id = method_config.get("include_user_id", False)
+
+    # ------------------------------------------------------------------
+    # 1. Build a compact numpy SID lookup array indexed by item_id.
+    #    sid_array[item_id] = expanded SID tuple (already offset-added).
+    #    Row 0 is unused (item IDs are 1-indexed).
+    # ------------------------------------------------------------------
+    # Determine n_levels from item_2_semantic_id
+    sample_item = next(iter(item_2_semantic_id))
+    n_levels = len(item_2_semantic_id[sample_item])
+
+    max_item_id = max(item_2_semantic_id.keys())
+    sid_array = np.zeros((max_item_id + 1, n_levels), dtype=np.int64)
+    for item_id, raw_sids in item_2_semantic_id.items():
+        sid_array[item_id] = expand_id(raw_sids, codebook_sizes)
+
+    # ------------------------------------------------------------------
+    # 2. Move item_embedding to CPU numpy once (avoids per-row GPU sync).
+    # ------------------------------------------------------------------
+    if isinstance(item_embedding, torch.Tensor):
+        emb_np = item_embedding.detach().cpu().numpy().astype(np.float32)
+    else:
+        emb_np = np.asarray(item_embedding, dtype=np.float32)
+
+    # ------------------------------------------------------------------
+    # 3. Split sequences into chunks for parallel processing.
+    # ------------------------------------------------------------------
+    if num_workers <= 0:
+        num_workers = max(1, mp.cpu_count() // 2)
+
+    chunk_size = max(1, (N + num_workers - 1) // num_workers)
+    chunks = [sequences[s : s + chunk_size] for s in range(0, N, chunk_size)]
+    actual_workers = len(chunks)
+
+    worker_args = [
         (
-            input_sids,
-            input_ids,
-            input_embeddings,
-            attention_mask_sids,
-            attention_mask_ids,
-            labels_sids,
-            labels_ids,
-            labels_embeddings,
-        ) = generate_input_sequence_custom(
-            sequences[seq],
-            item_2_semantic_id,
+            chunk,
+            sid_array,
+            emb_np,
             max_items_per_seq,
             max_sequence_length,
-            codebook_sizes,
-            item_embedding,
-            include_user_id=method_config.get("include_user_id", False),
-            user_id_offset=user_id_offset,
+            n_levels,
+            include_user_id,
+            user_id_offset,
         )
+        for chunk in chunks
+    ]
 
-        data["input_sids"].append(input_sids)
-        data["attention_mask_sids"].append(attention_mask_sids)
-        data["labels_sids"].append(labels_sids)
-        data["input_ids"].append(input_ids)
-        data["input_embeddings"].append(input_embeddings.cpu())
-        data["attention_mask_ids"].append(attention_mask_ids)
-        data["labels_ids"].append(labels_ids)
-        data["label_embeddings"].append(labels_embeddings.cpu())
+    print(f"  Building {N} sequences with {actual_workers} workers "
+          f"(chunk_size={chunk_size}) ...")
 
-    # Convert lists to tensors
-    for sub_key in data.keys():
-        if sub_key in ["label_embeddings"]:
-            if len(data[sub_key]) > 0:
-                data[sub_key] = torch.cat(data[sub_key])
-            else:
-                data[sub_key] = torch.tensor([])
-        elif sub_key in ["input_embeddings"]:
-            if len(data[sub_key]) > 0:
-                data[sub_key] = torch.stack(data[sub_key])
-            else:
-                data[sub_key] = torch.tensor([])
-        else:
-            data[sub_key] = torch.tensor(data[sub_key], dtype=torch.long)
+    if actual_workers == 1:
+        # Single-process path (avoids fork overhead for small datasets)
+        results = [_build_chunk(worker_args[0])]
+    else:
+        with mp.Pool(processes=actual_workers) as pool:
+            results = list(tqdm(
+                pool.imap(_build_chunk, worker_args),
+                total=actual_workers,
+                desc="Building dataset (parallel)",
+            ))
+
+    # ------------------------------------------------------------------
+    # 4. Concatenate chunk results and convert to torch tensors.
+    # ------------------------------------------------------------------
+    def _cat(idx):
+        return np.concatenate([r[idx] for r in results], axis=0)
+
+    input_sids_np       = _cat(0)
+    attn_sids_np        = _cat(1)
+    input_ids_np        = _cat(2)
+    attn_ids_np         = _cat(3)
+    labels_sids_np      = _cat(4)
+    labels_ids_np       = _cat(5)
+    input_emb_np        = _cat(6)
+    label_emb_np        = _cat(7)
+
+    data = {
+        "input_sids":          torch.from_numpy(input_sids_np),
+        "attention_mask_sids": torch.from_numpy(attn_sids_np),
+        "input_ids":           torch.from_numpy(input_ids_np),
+        "attention_mask_ids":  torch.from_numpy(attn_ids_np),
+        "labels_sids":         torch.from_numpy(labels_sids_np),
+        "labels_ids":          torch.from_numpy(labels_ids_np),
+        "input_embeddings":    torch.from_numpy(input_emb_np),
+        "label_embeddings":    torch.from_numpy(label_emb_np),
+    }
 
     return data
 
