@@ -74,20 +74,20 @@ class set_dir:
         os.makedirs(self.directory, exist_ok=True)
         os.makedirs(self.directory_processed, exist_ok=True)
 
-        if config["test_method"] in ["tiger", "liger"]:
+        if config["test_method"] in ["tiger", "liger", "letter"]:
             self.rqvae_save_dir = "./ID_generation/ID/"
             os.makedirs(self.rqvae_save_dir, exist_ok=True)
 
-            id_filename = (
+            self.id_filename = (
                 f"{config['dataset']['name']}_{config['dataset']['content_model']}"
             )
             self.id_save_location = os.path.join(
-                self.rqvae_save_dir, id_filename + f"_{config['seed']}.pkl"
+                self.rqvae_save_dir, self.id_filename + f"_{config['seed']}.pkl"
             )
 
         self.embedding_save_name = f"_{config['dataset']['content_model']}"
         self.embedding_save_path = os.path.join(
-            self.directory_processed, id_filename + "_embeddings.pt"
+            self.directory_processed, self.id_filename + "_embeddings.pt"
         )
 
         self.result_save_dir = f"./results/{config['test_method']}/"
@@ -121,7 +121,10 @@ def _build_model_tiger(method_config, model_config, n_semantic_codebook,
 
 def _build_model_residual(method_config, model_config, n_semantic_codebook,
                            max_items_per_seq, codebook_size, latent_size,
-                           rqvae_codebook_weights, device):
+                           rqvae_codebook_weights, device,
+                           flag_separate_bos_representation=False,
+                           sid_start_token_id=None,
+                           codebook_sizes=None):
     """Instantiate TIGER_Residual model."""
     codebook_loss_weight = method_config.get("codebook_loss_weight", 1.0)
     num_residual_levels = method_config.get(
@@ -129,8 +132,14 @@ def _build_model_residual(method_config, model_config, n_semantic_codebook,
     )
     soft_label_K = method_config.get("soft_label_K", 0)
     soft_label_temperature = method_config.get("soft_label_temperature", 1.0)
+    soft_label_temp_min = method_config.get("soft_label_temp_min", None)
+    soft_label_temp_decay_steps = method_config.get("soft_label_temp_decay_steps", 10000)
+    codebook_loss_weight_decay_steps = method_config.get("codebook_loss_weight_decay_steps", None)
     cumulative_residual_loss_weight = method_config.get("cumulative_residual_loss_weight", 0.0)
     cumulative_residual_loss_type = method_config.get("cumulative_residual_loss_type", "mse")
+    cumulative_residual_loss_temperature = method_config.get("cumulative_residual_loss_temperature", 1.0)
+    resid_nontf_ratio = method_config.get("resid_nontf_ratio", 0.0)
+    ntp_nontf_ratio = method_config.get("ntp_nontf_ratio", 0.0)
 
     model = TIGER_Residual(
         config=model_config,
@@ -146,9 +155,22 @@ def _build_model_residual(method_config, model_config, n_semantic_codebook,
         num_residual_levels=num_residual_levels,
         soft_label_K=soft_label_K,
         soft_label_temperature=soft_label_temperature,
+        soft_label_temp_min=soft_label_temp_min,
+        soft_label_temp_decay_steps=soft_label_temp_decay_steps,
+        codebook_loss_weight_decay_steps=codebook_loss_weight_decay_steps,
         cumulative_residual_loss_weight=cumulative_residual_loss_weight,
         cumulative_residual_loss_type=cumulative_residual_loss_type,
+        cumulative_residual_loss_temperature=cumulative_residual_loss_temperature,
+        resid_nontf_ratio=resid_nontf_ratio,
+        ntp_nontf_ratio=ntp_nontf_ratio,
+        flag_separate_bos_representation=flag_separate_bos_representation,
+        sid_start_token_id=sid_start_token_id,
     ).to(device)
+
+    # Set codebook offsets for LETTER tokenizer (variable codebook sizes per level)
+    if codebook_sizes is not None and not isinstance(codebook_sizes, int):
+        model.set_codebook_offsets(codebook_sizes)
+
     return model
 
 
@@ -308,6 +330,24 @@ def main(config: DictConfig) -> None:
     # We don't want test runs to pollute the training wandb dashboard.
     config["logging"]["mode"] = "offline"
 
+    # Validate dataset name — must not be empty and must be a known Amazon dataset
+    dataset_name = config["dataset"].get("name", "")
+    dataset_type = config["dataset"].get("type", "")
+    if not dataset_name:
+        raise ValueError(
+            f"dataset.name is empty or not set. "
+            f"For Amazon datasets, valid names are: Beauty, Toys_and_Games, Sports_and_Outdoors. "
+            f"Please set it in configs/dataset/amazon.yaml or via the command line, e.g. 'dataset.name=Beauty'."
+        )
+    if dataset_type == "Amazon" and dataset_name not in [
+        "Beauty", "Toys_and_Games", "Sports_and_Outdoors"
+    ]:
+        print(
+            f"WARNING: dataset.name='{dataset_name}' is not in the known Amazon dataset list "
+            f"[Beauty, Toys_and_Games, Sports_and_Outdoors]. "
+            f"Data download may fail with KeyError."
+        )
+
     try:
         # ── Step 1: Data preprocessing (same as run.py) ──
         data_file, id2meta_file, item2attribute_file = preprocessing(config["dataset"])
@@ -339,28 +379,113 @@ def main(config: DictConfig) -> None:
             config, device, id2meta_file, PATH_CONFIG.embedding_save_path
         )
 
-        # Train SID (RQ-VAE) — this is needed to get semantic IDs even for test-only.
+        # Train SID (RQ-VAE or LETTER) — this is needed to get semantic IDs even for test-only.
         # In practice, the SID file should already exist from a previous training run.
-        train_sid(
-            config, device, item_embedding, id_split, PATH_CONFIG.id_save_location
-        )
+        if config["test_method"] == "letter":
+            from ID_generation.train_letter import train as train_letter_sid
+
+            # Obtain CF embeddings (same logic as run.py)
+            cf_embedding = None
+            cf_emb_path = method_config.get("letter_cf_embedding_path", None)
+            sasrec_config = config["dataset"].get("SASRec", {})
+            if cf_emb_path is None:
+                cf_emb_dir = os.path.join(
+                    "./ID_generation/sasrec/ckpt/",
+                    f"{config['dataset']['name']}_{config['dataset']['content_model']}"
+                )
+                cf_emb_path = os.path.join(
+                    cf_emb_dir,
+                    f"{config['dataset']['name']}-{sasrec_config.get('hidden_units', 32)}d-sasrec.pt"
+                )
+
+            if os.path.exists(cf_emb_path):
+                cf_embedding = torch.load(cf_emb_path, map_location=device, weights_only=False)
+                if isinstance(cf_embedding, torch.Tensor):
+                    cf_embedding = cf_embedding.squeeze().detach().cpu().numpy()
+                print(f"✓ Loaded CF embeddings from {cf_emb_path}, shape: {cf_embedding.shape}")
+            else:
+                from ID_generation.sasrec import train_sasrec as _train_sasrec
+                from ID_generation.sasrec.train_sasrec import get_num_items_from_sequences
+                num_items = get_num_items_from_sequences(user_sequence)
+                _train_sasrec(
+                    user_sequences=user_sequence, num_items=num_items,
+                    device=device, save_path=cf_emb_path,
+                    hidden_units=sasrec_config.get("hidden_units", 32),
+                    num_heads=sasrec_config.get("num_heads", 2),
+                    num_blocks=sasrec_config.get("num_blocks", 2),
+                    max_len=sasrec_config.get("max_len", 50),
+                    dropout=sasrec_config.get("dropout", 0.2),
+                    epochs=sasrec_config.get("epochs", 200),
+                    lr=sasrec_config.get("lr", 0.001),
+                    batch_size=sasrec_config.get("batch_size", 128),
+                    weight_decay=sasrec_config.get("weight_decay", 0.0),
+                    eval_steps=sasrec_config.get("eval_steps", 10),
+                    patience=sasrec_config.get("patience", 20),
+                    seed=config.get("seed", 42),
+                )
+                cf_embedding = torch.load(cf_emb_path, map_location=device, weights_only=False)
+                if isinstance(cf_embedding, torch.Tensor):
+                    cf_embedding = cf_embedding.squeeze().detach().cpu().numpy()
+
+            train_letter_sid(
+                config, device, item_embedding, id_split, PATH_CONFIG.id_save_location,
+                cf_embedding=cf_embedding,
+            )
+            # Override RQ-VAE config for LETTER compatibility
+            letter_config = config["dataset"]["LETTER"]
+            train_config = {
+                **config["dataset"],
+                **{
+                    k: v
+                    for k, v in config.items()
+                    if k not in ["logging", "dataset", "method"]
+                },
+            }
+            train_config["RQ-VAE"]["code_book_size"] = max(letter_config["num_emb_list"])
+            train_config["RQ-VAE"]["num_layers"] = len(letter_config["num_emb_list"])
+        else:
+            train_sid(
+                config, device, item_embedding, id_split, PATH_CONFIG.id_save_location
+            )
 
         use_residual_decoder = method_config.get("use_residual_decoder", False)
 
         # ── Step 2: Load RQ-VAE codebook weights (for residual decoder) ──
+        # Compute codebook_sizes: for LETTER tokenizer, use per-level sizes;
+        # for TIGER/LIGER, use uniform codebook_size from RQ-VAE config.
+        if config["test_method"] == "letter":
+            letter_config = config["dataset"]["LETTER"]
+            codebook_sizes = list(letter_config["num_emb_list"])
+        else:
+            codebook_sizes = config["dataset"]["RQ-VAE"]["code_book_size"]
+        # Derive scalar codebook_size (for model __init__ and display)
+        if isinstance(codebook_sizes, int):
+            codebook_size = codebook_sizes
+        else:
+            codebook_size = codebook_sizes[0]
         rqvae_codebook_weights = None
-        codebook_size = config["dataset"]["RQ-VAE"]["code_book_size"]
 
         if use_residual_decoder:
             codebook_save_path = os.path.join(
                 PATH_CONFIG.rqvae_save_dir,
-                f"codebook_weights_{config['seed']}.pt",
+                f"{PATH_CONFIG.id_filename}_codebook_weights_{config['seed']}.pt",
             )
+            # For LETTER tokenizer, also check letter-specific codebook weights
+            letter_codebook_save_path = os.path.join(
+                PATH_CONFIG.rqvae_save_dir,
+                f"{PATH_CONFIG.id_filename}_letter_codebook_weights_{config['seed']}.pt",
+            )
+            # Also check alongside the SID .pkl file
             alt_paths = [
                 codebook_save_path,
+                letter_codebook_save_path,
                 os.path.join(
                     os.path.dirname(PATH_CONFIG.id_save_location),
-                    f"codebook_weights_{config['seed']}.pt",
+                    f"{PATH_CONFIG.id_filename}_codebook_weights_{config['seed']}.pt",
+                ),
+                os.path.join(
+                    os.path.dirname(PATH_CONFIG.id_save_location),
+                    f"{PATH_CONFIG.id_filename}_letter_codebook_weights_{config['seed']}.pt",
                 ),
             ]
 
@@ -432,7 +557,7 @@ def main(config: DictConfig) -> None:
             item_embedding,
             method_config,
             max_length=config["dataset"]["TIGER"]["n_positions"],
-            codebook_size=codebook_size,
+            codebook_sizes=codebook_sizes,
             max_items_per_seq=max_items_per_seq,
         )
 
@@ -476,13 +601,99 @@ def main(config: DictConfig) -> None:
         all_semantic_ids_t = torch.from_numpy(all_semantic_ids)
         unseen_semantic_ids_t = torch.from_numpy(unseen_semantic_ids)
 
-        last_codebook_size = max(max_last_semantic_ids, codebook_size)
-        if method_config["include_user_id"]:
-            this_vocab_size = 2000 + codebook_size * n_semantic_codebook + last_codebook_size + 2
+        last_codebook_size = (
+            max(max_last_semantic_ids, codebook_sizes)
+            if isinstance(codebook_sizes, int)
+            else max(max_last_semantic_ids, max(codebook_sizes))
+        )
+
+        # flag_separate_bos_representation: when True, add an extra SID_START token
+        # to the vocabulary. This must match the value used during training, otherwise
+        # the vocab_size (and hence shared.weight / lm_head.weight dimensions) will
+        # differ by 1 and loading the checkpoint will fail.
+        flag_separate_bos_representation = method_config.get("flag_separate_bos_representation", False)
+
+        # Compute sid_vocab_size based on whether codebook_sizes is int or list
+        if isinstance(codebook_sizes, int):
+            sid_vocab_size = codebook_sizes * n_semantic_codebook + last_codebook_size
         else:
-            this_vocab_size = codebook_size * n_semantic_codebook + last_codebook_size + 2
+            sid_vocab_size = sum(codebook_sizes) + last_codebook_size
+
+        print(f"   📊 Data-derived vocab stats:")
+        print(f"      codebook_sizes={codebook_sizes}, n_semantic_codebook={n_semantic_codebook}")
+        print(f"      max_last_semantic_ids={max_last_semantic_ids}, last_codebook_size={last_codebook_size}")
+        print(f"      include_user_id={method_config['include_user_id']}, use_id={method_config['use_id']}")
+
+        if method_config["include_user_id"]:
+            this_vocab_size = 2000 + sid_vocab_size + 2
+        else:
+            this_vocab_size = sid_vocab_size + 2
+
+        # When separating BOS representation from SID generation, we need an extra
+        # special token (SID_START) to trigger SID generation. Add 1 to vocab size.
+        if flag_separate_bos_representation:
+            this_vocab_size += 1
+
         if method_config["use_id"] == "item_id":
             this_vocab_size = item_embedding.shape[0] + 2
+
+        # SID_START token: placed just before EOS in the vocabulary
+        sid_start_token_id = this_vocab_size - 2 if flag_separate_bos_representation else None
+
+        print(f"      Computed vocab_size={this_vocab_size}")
+
+        # ── Auto-correct vocab_size from checkpoint ──
+        # The checkpoint's shared.weight shape reveals the vocab_size used during training.
+        # If it differs from our computed value (e.g., due to RQ-VAE non-determinism
+        # causing a different max_last_semantic_ids), we adjust to match the checkpoint.
+        checkpoint_path = config.get("checkpoint_path", None)
+        if checkpoint_path is None:
+            checkpoint_path = os.path.join(config["output_path"], "results", "ckpt_best.pt")
+
+        if os.path.exists(checkpoint_path):
+            ckpt_peek = torch.load(checkpoint_path, map_location=device, weights_only=False)
+            if "model_state_dict" in ckpt_peek:
+                ckpt_peek = ckpt_peek["model_state_dict"]
+            ckpt_vocab_size = ckpt_peek["shared.weight"].shape[0]
+            print(f"      Checkpoint vocab_size={ckpt_vocab_size} (from shared.weight shape)")
+
+            if ckpt_vocab_size != this_vocab_size:
+                delta = ckpt_vocab_size - this_vocab_size
+                print(f"   ⚠️  vocab_size mismatch: checkpoint={ckpt_vocab_size}, computed={this_vocab_size} (delta={delta})")
+                print(f"   → Auto-correcting vocab_size to {ckpt_vocab_size} to match checkpoint")
+                this_vocab_size = ckpt_vocab_size
+                # Recalculate flag_separate_bos_representation and sid_start_token_id
+                # Check if the delta of 1 is from the SID_START token
+                if isinstance(codebook_sizes, int):
+                    base_vocab = codebook_sizes * n_semantic_codebook + last_codebook_size + 2
+                else:
+                    base_vocab = sum(codebook_sizes) + last_codebook_size + 2
+                if method_config["include_user_id"]:
+                    base_vocab += 2000
+                if method_config["use_id"] == "item_id":
+                    base_vocab = item_embedding.shape[0] + 2
+                if ckpt_vocab_size == base_vocab + 1:
+                    flag_separate_bos_representation = True
+                    sid_start_token_id = this_vocab_size - 2
+                    print(f"   → Detected SID_START token in checkpoint (flag_separate_bos_representation=True)")
+                elif ckpt_vocab_size == base_vocab:
+                    flag_separate_bos_representation = False
+                    sid_start_token_id = None
+                else:
+                    # Larger delta — likely due to different max_last_semantic_ids
+                    # Adjust last_codebook_size accordingly
+                    if not method_config["include_user_id"] and method_config["use_id"] != "item_id":
+                        adjusted_last_cb = ckpt_vocab_size - (
+                            codebook_sizes * n_semantic_codebook
+                            if isinstance(codebook_sizes, int)
+                            else sum(codebook_sizes)
+                        ) - 2
+                        if flag_separate_bos_representation:
+                            adjusted_last_cb -= 1
+                        print(f"   → Adjusted last_codebook_size from {last_codebook_size} to {adjusted_last_cb}")
+                        last_codebook_size = adjusted_last_cb
+                    flag_separate_bos_representation = (ckpt_vocab_size == base_vocab + 1) if not method_config["use_id"] == "item_id" else False
+                    sid_start_token_id = this_vocab_size - 2 if flag_separate_bos_representation else None
 
         t5_config = config["dataset"]["TIGER"]["T5"]
         model_config = T5Config(
@@ -513,6 +724,9 @@ def main(config: DictConfig) -> None:
                 method_config, model_config, n_semantic_codebook,
                 max_items_per_seq, codebook_size, latent_size,
                 rqvae_codebook_weights, device,
+                flag_separate_bos_representation=flag_separate_bos_representation,
+                sid_start_token_id=sid_start_token_id,
+                codebook_sizes=codebook_sizes,
             )
         else:
             model = _build_model_tiger(
@@ -524,10 +738,10 @@ def main(config: DictConfig) -> None:
         print(f"Total number of parameters: {total_params}")
 
         # ── Step 6: Load checkpoint ──
-        checkpoint_path = OmegaConf.to_container(config).get("checkpoint_path", None)
-        if checkpoint_path is None or checkpoint_path == "None":
-            # Default: use the same path as training's best checkpoint
-            checkpoint_path = os.path.join(config["output_path"], "results", "ckpt_best.pt")
+        # (checkpoint_path already resolved during vocab auto-correct above)
+        # checkpoint_path = config.get("checkpoint_path", None)
+        # if checkpoint_path is None:
+        #     checkpoint_path = os.path.join(config["output_path"], "results", "ckpt_best.pt")
 
         if not os.path.exists(checkpoint_path):
             print(f"\n❌ Checkpoint not found: {checkpoint_path}")

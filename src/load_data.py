@@ -14,16 +14,51 @@ import torch
 from tqdm import trange
 
 
-def expand_id(id, codebook_size):
+def expand_id(id, codebook_sizes):
+    """Expand raw codebook indices to unique token IDs.
+
+    Args:
+        id: list of raw codebook indices (0-based per level)
+        codebook_sizes: list of codebook sizes per level (int or list[int]).
+            If int, all levels use the same size (backward compatible).
+            If list, each level uses its own size (needed for LETTER with
+            variable num_emb_list like [256, 256, 256, 256]).
+
+    Mapping: token_id[level_i] = raw_index[level_i] + sum(sizes[:i]) + 1
+    Token 0 is reserved for padding, token 1..(sum+1) are for SID levels,
+    and the last token is EOS.
+    """
+    if isinstance(codebook_sizes, int):
+        # Backward compatible: uniform codebook size for all levels
+        codebook_sizes = [codebook_sizes] * len(id)
+
     expanded_id = list(id)
+    offset = 1  # token 0 is padding, so start from 1
     for i_codebook_depth in range(len(expanded_id)):
-        expanded_id[i_codebook_depth] += codebook_size * i_codebook_depth + 1
+        expanded_id[i_codebook_depth] += offset
+        offset += codebook_sizes[i_codebook_depth]
     return expanded_id
 
 
-def expand_id_arr(id_arr, codebook_size):
-    for i_codebook_depth in range(id_arr.shape[1]):
-        id_arr[:, i_codebook_depth] += codebook_size * i_codebook_depth + 1
+def expand_id_arr(id_arr, codebook_sizes):
+    """Expand raw codebook indices array to unique token IDs (in-place).
+
+    Args:
+        id_arr: numpy array of shape [n_items, n_levels] with raw indices
+        codebook_sizes: list of codebook sizes per level (int or list[int]).
+            If int, all levels use the same size (backward compatible).
+    """
+    n_levels = id_arr.shape[1]
+    if isinstance(codebook_sizes, int):
+        # Backward compatible: uniform codebook size for all levels
+        for i_codebook_depth in range(n_levels):
+            id_arr[:, i_codebook_depth] += codebook_sizes * i_codebook_depth + 1
+    else:
+        # Variable codebook sizes: cumulative offset
+        offset = 1  # token 0 is padding, start from 1
+        for i_codebook_depth in range(n_levels):
+            id_arr[:, i_codebook_depth] += offset
+            offset += codebook_sizes[i_codebook_depth]
 
 
 def pad_sequence(sequence, length, pad_token):
@@ -33,10 +68,11 @@ def pad_sequence(sequence, length, pad_token):
     return sequence + [pad_token] + [0] * (length - len(sequence) - 1)
 
 
-def get_unique_semantic_ids_by_extra_position(semantic_ids, codebook_size): #增添额外的id，避免冲突
+def get_unique_semantic_ids_by_extra_position(semantic_ids, codebook_sizes): #增添额外的id，避免冲突
     """
     In this function, we load the semantic IDs, and then assign the extra one semantic id to avoid duplication.
-    :param path: where the learned semantic ID is saved
+    :param semantic_ids: numpy array of shape [n_items, n_levels]
+    :param codebook_sizes: list of codebook sizes per level (int or list[int])
     """
     semantic_id_2_item_count = dict({})
     item_2_semantic_id, semantic_id_2_item = {}, {}
@@ -70,7 +106,7 @@ def get_unique_semantic_ids_by_extra_position(semantic_ids, codebook_size): #增
     max_last_semantic_ids = (
         all_semantic_ids[:, -1].max() + 1
     )  # this is actually the number of unique semantic id in the 4th position
-    expand_id_arr(all_semantic_ids, codebook_size)
+    expand_id_arr(all_semantic_ids, codebook_sizes)
     return item_2_semantic_id, max_last_semantic_ids
 
 
@@ -80,7 +116,7 @@ def generate_input_sequence(
     item_2_semantic_id,
     max_items_per_seq,
     max_sequence_length,
-    codebook_size,
+    codebook_sizes,
     item_embedding,
     id_only,
 ):
@@ -98,7 +134,7 @@ def generate_input_sequence(
         if i == len(user_sequence) - 1:
             if not id_only:
                 labels_sids.extend(
-                    expand_id(item_2_semantic_id[user_sequence[i]], codebook_size)
+                    expand_id(item_2_semantic_id[user_sequence[i]], codebook_sizes)
                 )
             this_item_embedding = item_embedding[[user_sequence[i] - 1]]
             # item id starts from 1, 1 ~ n_item
@@ -108,7 +144,7 @@ def generate_input_sequence(
         else:
             if not id_only:
                 input_semantic_ids = expand_id(
-                    item_2_semantic_id[user_sequence[i]], codebook_size
+                    item_2_semantic_id[user_sequence[i]], codebook_sizes
                 )
                 input_sids.extend(input_semantic_ids)
             input_ids.append(user_sequence[i])
@@ -162,7 +198,7 @@ def load_data_helper(
     max_items_per_seq,
     max_sequence_length,
     user_id_offset,
-    codebook_size,
+    codebook_sizes,
     id_only=False,
 ):
     total_user_dict = {}
@@ -218,7 +254,7 @@ def load_data_helper(
                 item_2_semantic_id,
                 max_items_per_seq,
                 max_sequence_length,
-                codebook_size,
+                codebook_sizes,
                 item_embedding,
                 id_only,
             )
@@ -276,7 +312,7 @@ def load_data(
     item_embedding,
     method_config,
     max_length=258,
-    codebook_size=256,
+    codebook_sizes=None,
     max_items_per_seq=np.inf,
 ):
     """
@@ -285,40 +321,61 @@ def load_data(
     :param unseen_val, unseen_test, seen: semantic ID np.array
     :param item_embedding: [n_item, n_embd], where n_embd is sentence-T5 embedding dimension
     :param max_length: for the generated sequence
+    :param codebook_sizes: list of codebook sizes per level (int or list[int]).
+        If None, uses uniform codebook_size=256 (backward compatible).
     :param max_items_per_seq: number of items in each sequence
     """
     n_semantic_codebook = 3
 
     semantic_ids = pickle.load(open(path, "rb"))
 
+    # Dynamically determine n_semantic_codebook from the actual data shape
+    # LETTER tokenizer can produce different numbers of codebook levels (e.g., 4)
+    if isinstance(semantic_ids, np.ndarray) and semantic_ids.ndim == 2:
+        n_semantic_codebook = semantic_ids.shape[1]
+
+    # Default: uniform codebook size of 256 for all levels (backward compatible)
+    if codebook_sizes is None:
+        codebook_sizes = 256
+
     item_2_semantic_id, max_last_semantic_ids = (
-        get_unique_semantic_ids_by_extra_position(semantic_ids, codebook_size)
+        get_unique_semantic_ids_by_extra_position(semantic_ids, codebook_sizes)
     )
-    last_codebook_size = max(max_last_semantic_ids, codebook_size)
+
+    # Compute last_codebook_size based on whether codebook_sizes is a list or int
+    if isinstance(codebook_sizes, int):
+        last_codebook_size = max(max_last_semantic_ids, codebook_sizes)
+    else:
+        last_codebook_size = max(max_last_semantic_ids, max(codebook_sizes))
+
     n_codebook = n_semantic_codebook + 1  # actual number of codebook
 
     # split into train/val/test items
     val_unseen_semantic_ids = np.array([item_2_semantic_id[idx] for idx in unseen_val])
-    expand_id_arr(val_unseen_semantic_ids, codebook_size)
+    expand_id_arr(val_unseen_semantic_ids, codebook_sizes)
     test_unseen_semantic_ids = np.array(
         [item_2_semantic_id[idx] for idx in unseen_test]
     )
-    expand_id_arr(test_unseen_semantic_ids, codebook_size)
+    expand_id_arr(test_unseen_semantic_ids, codebook_sizes)
     seen_semantic_ids = np.array([item_2_semantic_id[idx] for idx in seen])
-    expand_id_arr(seen_semantic_ids, codebook_size)
+    expand_id_arr(seen_semantic_ids, codebook_sizes)
     all_semantic_ids = np.array(
         [item_2_semantic_id[idx] for idx in item_2_semantic_id.keys()]
     )
-    expand_id_arr(all_semantic_ids, codebook_size)
+    expand_id_arr(all_semantic_ids, codebook_sizes)
 
     # get semantic id - embedding dict
     semantic_id_2_embd = dict({})
     for key in item_2_semantic_id.keys():  # again, the key here start from 1
-        semantic_id_2_embd[tuple(expand_id(item_2_semantic_id[key], codebook_size))] = (
+        semantic_id_2_embd[tuple(expand_id(item_2_semantic_id[key], codebook_sizes))] = (
             item_embedding[key - 1]
         )
 
-    user_id_offset = 1 + n_semantic_codebook * codebook_size + last_codebook_size
+    # Compute user_id_offset: 1 (padding) + sum of all codebook level sizes + last_codebook_size
+    if isinstance(codebook_sizes, int):
+        user_id_offset = 1 + n_semantic_codebook * codebook_sizes + last_codebook_size
+    else:
+        user_id_offset = 1 + sum(codebook_sizes) + last_codebook_size
     training_data, val_data, unseen_val_data, test_data, unseen_test_data = (
         load_data_helper(
             user_sequence,
@@ -330,7 +387,7 @@ def load_data(
             max_items_per_seq,
             max_length,
             user_id_offset,
-            codebook_size,
+            codebook_sizes,
         )
     )
 

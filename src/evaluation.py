@@ -340,6 +340,290 @@ def evaluate(
     return recall_dict, ndcg_dict, returned_cand, returned_predicted_embedding
 
 
+def model_forward_simple_residual(model, batch, device, n_codebook, method_config, skip_forward=False):
+    """
+    Model forward for Simple_Residual (auxiliary codebook/residual losses only).
+
+    Same as model_forward_residual — calls model.forward_residual() for training.
+    The only difference is that generation uses standard model.generate() instead
+    of model.generate_residual(), so input_kwargs must be compatible with T5's
+    built-in generate() method.
+    """
+    if method_config["use_id"] == "sid":
+        input_sids = batch["input_sids"].to(device)
+        attention_mask_sids = batch["attention_mask_sids"].to(device)
+        labels_sids = batch["labels_sids"].to(device)
+        if method_config["flag_add_input_embedding"]:
+            input_text_embeddings = batch["input_embeddings"].to(device).detach()
+            max_length = input_text_embeddings.shape[1]
+        item_idx_start = 1 if method_config["include_user_id"] else 0
+
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            if method_config["flag_add_input_embedding"]:
+                inputs_embeds = model.shared(input_sids)
+                input_text_embeddings_shape = input_text_embeddings.shape
+                input_text_embeddings_repeat = (
+                    input_text_embeddings[:, :, None, :]
+                    .repeat(1, 1, n_codebook, 1)
+                    .reshape(-1, input_text_embeddings_shape[-1])
+                )
+                proj_embd = model.emb_proj(input_text_embeddings_repeat)
+                proj_embd = proj_embd.reshape(
+                    input_text_embeddings_shape[0], -1, proj_embd.shape[-1]
+                )
+                pos_id = torch.arange(max_length, dtype=torch.long, device=device)
+                pos_id = pos_id[:, None].repeat(1, n_codebook).reshape(-1)
+                pos_embd = model.pos_embedding(pos_id)
+                proj_embd += pos_embd[None, :]
+                append_embedding = torch.zeros_like(inputs_embeds)
+                append_embedding[
+                    :, item_idx_start : item_idx_start + n_codebook * max_length
+                ] = proj_embd
+                inputs_embeds += append_embedding
+                seq_len = inputs_embeds.shape[1]
+                pattern = torch.arange(n_codebook)
+                semantic_pos = pattern.repeat(seq_len // n_codebook + 1)[:seq_len]
+                pos_embedding = model.semantic_pos(semantic_pos.to(device))
+                inputs_embeds += pos_embedding[None, :, :]
+                inputs_embeds = model.input_embed_layernorm(inputs_embeds)
+                inputs_embeds = model.input_embed_dropout(inputs_embeds)
+
+                if skip_forward:
+                    outputs = None
+                else:
+                    outputs = model.forward_residual(
+                        inputs_embeds=inputs_embeds,
+                        attention_mask=attention_mask_sids,
+                        labels_sids=labels_sids,
+                    )
+
+                # input_kwargs compatible with T5's built-in generate()
+                input_kwargs = {
+                    "inputs_embeds": inputs_embeds,
+                    "attention_mask": attention_mask_sids,
+                }
+            else:
+                if skip_forward:
+                    outputs = None
+                else:
+                    outputs = model.forward_residual(
+                        input_ids=input_sids,
+                        attention_mask=attention_mask_sids,
+                        labels_sids=labels_sids,
+                    )
+
+                input_kwargs = {
+                    "input_ids": input_sids,
+                    "attention_mask": attention_mask_sids,
+                }
+    else:
+        # item_id mode — fall back to standard forward (simple_residual only for SID)
+        input_ids = batch["input_ids"].to(device)
+        attention_mask_ids = batch["attention_mask_ids"].to(device)
+        labels_ids = batch["labels_ids"].to(device)
+
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask_ids,
+                labels=labels_ids,
+            )
+            input_kwargs = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask_ids,
+            }
+
+    return outputs, input_kwargs
+
+
+@torch.no_grad()
+def evaluate_simple_residual(
+    model,
+    dataloader,
+    all_semantic_ids,
+    device,
+    method_config,
+    KEYS,
+    RETRIEVE_KEY,
+):
+    """
+    Evaluation for Simple_Residual model.
+
+    Uses standard model.generate() (T5 built-in beam search) because
+    Simple_Residual does not inject residual into decoder input, so
+    generation is identical to base TIGER.
+    """
+
+    model.eval()
+    recall_dict, ndcg_dict = dict({}), dict({})
+    returned_cand = []
+    returned_predicted_embedding = []
+
+    for batch in tqdm(dataloader):
+        labels = batch["labels_sids"].to(device)
+
+        with torch.no_grad():
+            _, input_kwargs = model_forward_simple_residual(
+                model,
+                batch,
+                device,
+                all_semantic_ids.shape[-1],
+                method_config,
+                skip_forward=True,
+            )
+
+        batch_size, n_codebook = labels.shape[0], labels.shape[1]
+
+        num_return_sequences = max(RETRIEVE_KEY)
+        num_beams = max(RETRIEVE_KEY)
+        assert (
+            max(KEYS) <= num_return_sequences
+        ), "The number of return sequences should be greater than or equal to the number of keys."
+        gen_kwargs = {
+            "num_beams": num_beams,
+            "max_new_tokens": n_codebook,
+            "num_return_sequences": num_return_sequences,
+        }
+        gen_kwargs["use_cache"] = True
+
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            outputs = model.generate(**input_kwargs, **gen_kwargs)
+        predicted_embedding = model.predicted_embedding
+
+        outputs = outputs[:, 1 : 1 + n_codebook].reshape(
+            batch_size, num_return_sequences, -1
+        )  # [B, n_return_seq, n_codebook]
+        if predicted_embedding is not None:
+            returned_predicted_embedding.extend(
+                predicted_embedding.reshape(batch_size, num_return_sequences, -1)[:, 0]
+            )  # [B, n_embd]
+
+        if outputs.shape[-1] < n_codebook:
+            to_pad = n_codebook - outputs.shape[-1]
+            pad_tensor = torch.zeros(
+                (batch_size, gen_kwargs["num_return_sequences"], to_pad),
+                device=outputs.device,
+            )
+            outputs = torch.cat([outputs, pad_tensor], dim=-1)
+
+        returned_cand.extend(outputs)
+
+        _recall_at_i, _ndcg_at_i = calculate_metrics(
+            outputs, labels, codebook_level=n_codebook, KEYS=KEYS
+        )
+
+        for key in _recall_at_i.keys():
+            if key not in recall_dict.keys():
+                recall_dict[key] = []
+                ndcg_dict[key] = []
+
+        for key in _recall_at_i.keys():
+            recall_dict[key].extend(_recall_at_i[key])
+            ndcg_dict[key].extend(_ndcg_at_i[key])
+
+    return recall_dict, ndcg_dict, returned_cand, returned_predicted_embedding
+
+
+# =============================================================================
+# Soft Label Functions (TIGER_SoftLabel — no residual, soft labels for SID)
+# =============================================================================
+
+
+def model_forward_softlabel(model, batch, device, n_codebook, method_config, skip_forward=False):
+    """
+    Model forward for TIGER_SoftLabel with distance-based soft labels.
+
+    Prepares encoder inputs and calls model.forward_softlabel() for training,
+    or prepares input_kwargs for generation (same as standard TIGER, since
+    TIGER_SoftLabel uses standard T5 beam search for generation — no residual
+    interleaving).
+    """
+    if method_config["use_id"] == "sid":
+        input_sids = batch["input_sids"].to(device)
+        attention_mask_sids = batch["attention_mask_sids"].to(device)
+        labels_sids = batch["labels_sids"].to(device)
+        if method_config["flag_add_input_embedding"]:
+            input_text_embeddings = batch["input_embeddings"].to(device).detach()
+            max_length = input_text_embeddings.shape[1]
+        item_idx_start = 1 if method_config["include_user_id"] else 0
+
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            if method_config["flag_add_input_embedding"]:
+                inputs_embeds = model.shared(input_sids)
+                input_text_embeddings_shape = input_text_embeddings.shape
+                input_text_embeddings_repeat = (
+                    input_text_embeddings[:, :, None, :]
+                    .repeat(1, 1, n_codebook, 1)
+                    .reshape(-1, input_text_embeddings_shape[-1])
+                )
+                proj_embd = model.emb_proj(input_text_embeddings_repeat)
+                proj_embd = proj_embd.reshape(
+                    input_text_embeddings_shape[0], -1, proj_embd.shape[-1]
+                )
+                pos_id = torch.arange(max_length, dtype=torch.long, device=device)
+                pos_id = pos_id[:, None].repeat(1, n_codebook).reshape(-1)
+                pos_embd = model.pos_embedding(pos_id)
+                proj_embd += pos_embd[None, :]
+                append_embedding = torch.zeros_like(inputs_embeds)
+                append_embedding[
+                    :, item_idx_start : item_idx_start + n_codebook * max_length
+                ] = proj_embd
+                inputs_embeds += append_embedding
+                seq_len = inputs_embeds.shape[1]
+                pattern = torch.arange(n_codebook)
+                semantic_pos = pattern.repeat(seq_len // n_codebook + 1)[:seq_len]
+                pos_embedding = model.semantic_pos(semantic_pos.to(device))
+                inputs_embeds += pos_embedding[None, :, :]
+                inputs_embeds = model.input_embed_layernorm(inputs_embeds)
+                inputs_embeds = model.input_embed_dropout(inputs_embeds)
+
+                if skip_forward:
+                    outputs = None
+                else:
+                    outputs = model.forward_softlabel(
+                        inputs_embeds=inputs_embeds,
+                        attention_mask=attention_mask_sids,
+                        labels_sids=labels_sids,
+                    )
+
+                input_kwargs = {
+                    "inputs_embeds": inputs_embeds,
+                    "attention_mask": attention_mask_sids,
+                }
+            else:
+                if skip_forward:
+                    outputs = None
+                else:
+                    outputs = model.forward_softlabel(
+                        input_ids=input_sids,
+                        attention_mask=attention_mask_sids,
+                        labels_sids=labels_sids,
+                    )
+
+                input_kwargs = {
+                    "input_ids": input_sids,
+                    "attention_mask": attention_mask_sids,
+                }
+    else:
+        # item_id mode — fall back to standard forward
+        input_ids = batch["input_ids"].to(device)
+        attention_mask_ids = batch["attention_mask_ids"].to(device)
+        labels_ids = batch["labels_ids"].to(device)
+
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            outputs = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask_ids,
+                labels=labels_ids,
+            )
+            input_kwargs = {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask_ids,
+            }
+
+    return outputs, input_kwargs
+
+
 def get_target_embed(predicted_embedding, model, method_config, item_embedding):
     if len(item_embedding.shape) == 3:  # this is used in generate_then_dense
         assert (
@@ -533,6 +817,68 @@ def generate_then_dense(
     recall_dict_total, ndcg_dict_total = dict({}), dict({})
     if len(returned_cand) == 0:
         return recall_dict_total, ndcg_dict_total
+
+    returned_cand = torch.stack(returned_cand)  # [num_items, num_candidate, n_code]
+    item2sid_tensor = torch.from_numpy(item2sid).to(device)
+    unseen_semantic_ids = unseen_semantic_ids.to(device)
+    returned_embd = torch.stack(returned_embd, dim=0)  # [num_items, n_embd]
+    num_candidates = max(KEYS)
+    idx_start = 0
+    for batch in tqdm(dataloader, desc="Generating and Dense Retrieval"):
+        labels = batch["labels_sids"].to(device)
+        batch_size, n_codebook = (
+            labels.shape[0],
+            labels.shape[1],
+        )
+        predicted_embedding = returned_embd[idx_start : idx_start + batch_size]
+        this_batch_cand = returned_cand[
+            idx_start : idx_start + batch_size,
+        ]  # [batch_size, num_candidate, n_code]
+        idx_start += batch_size
+        cold_cand = torch.stack([unseen_semantic_ids] * this_batch_cand.shape[0], dim=0)
+        for _retrieve_key in RETRIEVE_KEY:
+            if _retrieve_key not in recall_dict_total.keys():
+                recall_dict_total[_retrieve_key] = dict({})
+                ndcg_dict_total[_retrieve_key] = dict({})
+            _this_batch_cand = this_batch_cand[:, :_retrieve_key]
+            _this_batch_cand = torch.cat([_this_batch_cand, cold_cand], dim=1)
+            matches = torch.all(
+                _this_batch_cand[:, :, None] == item2sid_tensor[None, None, :, :],
+                dim=-1,
+            )
+            # [batch_size, num_candidate, num_items]
+            indices = torch.argmax(matches.int(), dim=2)  # [batch_size, num_candidate]
+            cand_item_embedding = item_embedding[
+                indices
+            ]  # [batch_size, num_candidate_item_embedding]
+            _, logits = get_target_embed(
+                predicted_embedding, model, method_config, cand_item_embedding
+            )
+            # [batch_size, n_items]
+            _topk = min(num_candidates, logits.shape[1])
+            candidate_idx = logits.topk(_topk, dim=1, largest=True)[
+                1
+            ]  # [batch_size, num_candidates]
+            candidate_sid = _this_batch_cand[
+                torch.arange(batch_size)[:, None], candidate_idx
+            ]  # [batch_size, num_candidates, n_codebook] -> [batch_size, topk, n_codebook]
+            _recall_at_i, _ndcg_at_i = calculate_metrics(
+                candidate_sid,
+                labels,
+                codebook_level=n_codebook,
+                KEYS=KEYS,
+                lift_constraint=True,
+            )
+            # lift the constraint to have unique candidate, since we append the output from generative retrieval with the cold start candidates
+            for key in _recall_at_i.keys():
+                if key not in recall_dict_total[_retrieve_key].keys():
+                    recall_dict_total[_retrieve_key][key] = []
+                    ndcg_dict_total[_retrieve_key][key] = []
+            for key in _recall_at_i.keys():
+                recall_dict_total[_retrieve_key][key].extend(_recall_at_i[key])
+                ndcg_dict_total[_retrieve_key][key].extend(_ndcg_at_i[key])
+
+    return recall_dict_total, ndcg_dict_total
 
 
 # =============================================================================

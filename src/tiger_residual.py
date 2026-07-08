@@ -1,6 +1,16 @@
 """
-TIGER_Residual: TIGER model with residual information from RQ-VAE codebooks
-interleaved in the decoder for improved semantic ID generation.
+TIGER_Residual: TIGER model with recursive residual information from RQ-VAE
+codebooks interleaved in the decoder for improved semantic ID generation.
+
+The residual computation follows the RQ-VAE recursive pattern:
+  k=0: residual_0 = output_adapter[0](hidden_0) - codebook_emb[0][sid_0]
+  k>0: residual_k = output_adapter[k](hidden_resid_{k-1}) - codebook_emb[k][sid_k]
+
+At each step k>0, the output_adapter[k] projects the previous step's residual
+decoder output (hidden_resid_{k-1}) to latent space, then subtracts the current
+level's codebook entry. This mirrors how RQ-VAE quantizes: each level subtracts
+its codebook entry from the *previous residual representation*, not from a fresh
+projection of the original input.
 
 The generation process:
   Standard: <BOS> -> resid_0 -> sid_0 -> resid_1 -> sid_1 -> ... -> sid_{n-2} -> sid_{n-1}
@@ -11,12 +21,36 @@ Where:
   - Residual positions (resid_k):     input = residual vector,   output = hidden -> MSE loss
 """
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import T5Config
 
 from .tiger import TIGER
+
+
+def _kv_to_dynamic_cache(past_key_values):
+    """Convert tuple-based KV cache to DynamicCache for transformers >= 4.44.
+
+    Newer transformers versions require DynamicCache instead of raw tuples.
+    Returns None if input is None, DynamicCache if input is a tuple,
+    or the input unchanged if already a DynamicCache.
+    """
+    if past_key_values is None:
+        return None
+    # Already a cache object (DynamicCache or compatible)
+    if hasattr(past_key_values, 'get_seq_length'):
+        return past_key_values
+    # Convert tuple: ((key_layer, value_layer), ...) -> DynamicCache
+    from transformers.cache_utils import DynamicCache
+    cache = DynamicCache()
+    for layer_idx, layer_kv in enumerate(past_key_values):
+        if layer_kv is not None:
+            key, value = layer_kv
+            cache.update(key, value, layer_idx)
+    return cache
 
 
 class TIGER_Residual(TIGER):
@@ -41,13 +75,48 @@ class TIGER_Residual(TIGER):
         soft_label_temperature: temperature for softmax normalization of distance-based
             soft labels. Higher = more uniform across K entries, lower = sharper (ground
             truth dominates). Default: 1.0.
+        soft_label_temp_min: minimum temperature for soft-label temperature scheduling.
+            As training progresses, the soft-label temperature linearly decays from
+            soft_label_temperature (initial) to this value, making the distribution
+            progressively sharper. Only used when soft_label_K > 0.
+            Default: None (no scheduling, temperature stays fixed at soft_label_temperature).
+        soft_label_temp_decay_steps: total training steps over which the temperature
+            decays from soft_label_temperature to soft_label_temp_min.
+            Each forward_residual call counts as one step.
+            Only used when soft_label_temp_min is set.
+            Default: 10000.
+        codebook_loss_weight_decay_steps: per-position codebook loss weight decay schedule.
+            null = no decay (backward compatible, weight stays at codebook_loss_weight).
+            list of (int or null) per codebook level, e.g. [5000, null, null, null]
+            → position 0 decays over 5000 steps, others stay fixed.
+            Uses cosine decay: alpha = 0.5 * (1 + cos(pi * step / decay_steps)),
+            decaying from 1.0 to 0.0. The effective weight for position k is:
+              codebook_loss_weight * alpha_k(step).
+            This implements "training wheel removal" — auxiliary loss provides
+            structure prior early on (accelerating convergence) but may become
+            a ceiling later when soft-label nearest-neighbors are imperfect.
+            Cosine decay keeps weight high early, then rapidly withdraws the
+            signal in mid-training. Each forward_residual call counts as one step.
+            Default: None.
         cumulative_residual_loss_weight: weight for cumulative residual alignment loss.
             At each residual position k, constrains output_adapter[k+1](hidden_resid_k)
             to be close to sum(codebook_emb[t][sid_t] for t in [k+1, ..., n-1]).
             This enforces that the residual representation captures the *full remaining*
             codebook content, not just the next codebook index. Default: 0.0 (disabled).
-        cumulative_residual_loss_type: "mse" for L2 regression or "cosine" for cosine
-            similarity loss. Default: "mse".
+        cumulative_residual_loss_type: "mse" for L2 regression, "cosine" for cosine
+            similarity loss, or "ce" for batch-wise cross-entropy loss based on
+            inner product (InfoNCE-style contrastive loss). With "ce", each sample's
+            predicted residual representation (hidden_resid_latent) is treated as a
+            query, and all samples' cumulative codebook targets (target_cumul) in the
+            batch serve as keys. The positive pair is the same sample index (diagonal),
+            and all other samples are negatives. The cross-entropy loss encourages the
+            residual representation to be more discriminative across items.
+            Default: "mse".
+        cumulative_residual_loss_temperature: temperature scaling for the "ce" loss
+            type. Divides the inner-product logits before softmax. Higher temperature
+            yields softer probability distributions (easier negatives), lower temperature
+            makes the loss focus more on hard negatives. Only used when
+            cumulative_residual_loss_type="ce". Default: 1.0.
         resid_nontf_ratio: probability of using the model's predicted sid_k (instead of
             ground truth sid_k) for codebook index selection at each residual step.
             Per-step, per-sample: at each residual step k, each sample independently
@@ -93,8 +162,12 @@ class TIGER_Residual(TIGER):
         num_residual_levels: int = None,
         soft_label_K: int = 0,
         soft_label_temperature: float = 1.0,
+        soft_label_temp_min: float = None,
+        soft_label_temp_decay_steps: int = 10000,
+        codebook_loss_weight_decay_steps: list = None,
         cumulative_residual_loss_weight: float = 0.0,
         cumulative_residual_loss_type: str = "mse",
+        cumulative_residual_loss_temperature: float = 1.0,
         resid_nontf_ratio: float = 0.0,
         ntp_nontf_ratio: float = 0.0,
         flag_separate_bos_representation: bool = False,
@@ -113,6 +186,10 @@ class TIGER_Residual(TIGER):
         self.d_model = config.d_model
         self.codebook_size = codebook_size
         self.codebook_loss_weight = codebook_loss_weight
+        # Precompute SID token offsets for each codebook level.
+        # With uniform codebook_size: offset[level] = codebook_size * level + 1
+        # With variable codebook_sizes: offset[level] = 1 + sum(codebook_sizes[:level])
+        self._codebook_offsets = None  # set by set_codebook_offsets()
         self.num_residual_levels = (
             num_residual_levels
             if num_residual_levels is not None
@@ -120,8 +197,14 @@ class TIGER_Residual(TIGER):
         )
         self.soft_label_K = soft_label_K
         self.soft_label_temperature = soft_label_temperature
+        self.soft_label_temp_min = soft_label_temp_min
+        self.soft_label_temp_decay_steps = soft_label_temp_decay_steps
+        self._soft_label_temp_step = 0  # step counter for temperature scheduling
+        self.codebook_loss_weight_decay_steps = codebook_loss_weight_decay_steps
+        self._codebook_weight_decay_step = 0  # step counter for weight decay scheduling
         self.cumulative_residual_loss_weight = cumulative_residual_loss_weight
         self.cumulative_residual_loss_type = cumulative_residual_loss_type
+        self.cumulative_residual_loss_temperature = cumulative_residual_loss_temperature
         self.resid_nontf_ratio = resid_nontf_ratio
         self.ntp_nontf_ratio = ntp_nontf_ratio
         self.flag_separate_bos_representation = flag_separate_bos_representation
@@ -151,16 +234,9 @@ class TIGER_Residual(TIGER):
                     torch.randn(codebook_size, latent_size) * 0.01,
                 )
 
-        # ── Per-position adapters (no parameter sharing across levels) ──
-        # Different residual levels have different semantics, so each position
-        # needs its own adapter to map between backbone space and codebook space.
-        # Residuals are computed in codebook latent space (like RQ-VAE), so:
-        #   - output_adapters[k]: d_model → latent  (project hidden to codebook space for residual & MSE)
-        #   - input_adapters[k]:  latent → d_model  (project residual back to backbone space for decoder)
 
-        # Input adapters (k-1): map residual vector from codebook latent space
-        # to backbone's d_model space before feeding into the decoder.
-        # Each residual level gets its own adapter.
+
+
         self.input_adapters = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(self.latent_size, self.d_model, bias=False),
@@ -169,11 +245,8 @@ class TIGER_Residual(TIGER):
             for _ in range(self.num_residual_levels)
         ])
 
-        # Output adapters (k): map decoder hidden vector to codebook latent space.
-        # Used for: (1) projecting hidden_k to latent for residual computation,
-        #            (2) projecting hidden_resid to latent for MSE alignment.
-        # All k adapters are utilized — adapter[k] at residual position k,
-        # adapter[k+1] at MSE position k.
+   
+
         self.output_adapters = nn.ModuleList([
             nn.Sequential(
                 nn.Linear(self.d_model, self.latent_size, bias=False),
@@ -199,9 +272,33 @@ class TIGER_Residual(TIGER):
 
     def _get_codebook_idx(self, sid_tokens, level):
         """Convert SID token to codebook index (0 to codebook_size-1)."""
-        # SID token = original_code + codebook_size * level + 1
-        cb_idx = sid_tokens - 1 - level * self.codebook_size
+        # SID token = original_code + offset[level]
+        # where offset is either codebook_size * level + 1 (uniform)
+        # or cumulative sum of codebook_sizes + 1 (variable, for LETTER)
+        if self._codebook_offsets is not None:
+            cb_idx = sid_tokens - self._codebook_offsets[level]
+        else:
+            cb_idx = sid_tokens - 1 - level * self.codebook_size
         return cb_idx.clamp(0, self.codebook_size - 1)
+
+    def set_codebook_offsets(self, codebook_sizes):
+        """
+        Set SID token offsets for variable codebook sizes (e.g., LETTER tokenizer).
+
+        Args:
+            codebook_sizes: list of per-level codebook sizes (e.g., [256, 256, 256, 256]).
+                           Can also be an int for uniform sizes (backward compatible).
+        """
+        if isinstance(codebook_sizes, int):
+            # Uniform: offset[level] = codebook_sizes * level + 1
+            n_levels = self.n_semantic_codebook
+            self._codebook_offsets = [codebook_sizes * i + 1 for i in range(n_levels)]
+        else:
+            # Variable (LETTER): offset[level] = 1 + sum(codebook_sizes[:level])
+            offsets = [1]
+            for sz in codebook_sizes[:-1]:  # exclude last since we only need offsets for existing levels
+                offsets.append(offsets[-1] + sz)
+            self._codebook_offsets = offsets
 
     def forward_residual(
         self,
@@ -259,12 +356,47 @@ class TIGER_Residual(TIGER):
 
         encoder_hidden = encoder_outputs.last_hidden_state
 
-        # ---- Pre-compute cumulative codebook sums for cumulative residual loss ----
-        # cumsum_gt[t] = sum(codebook_emb[j][sid_j] for j in [t, ..., n_sem-1])
-        # Only iterate over registered codebook levels (n_sem), since the cumulative
-        # target is only used at residual positions k < num_resid (≤ n_sem-1).
-        # At residual position k, the target is cumsum_gt[k+1] — the remaining
-        # codebook content from level k+1 to n_sem-1 that needs to be captured.
+        # ── Compute scheduled soft-label temperature ──
+        # Linear decay from soft_label_temperature (initial) to soft_label_temp_min
+        # over soft_label_temp_decay_steps forward calls.
+        soft_label_temp_progress = 0.0
+        soft_label_temp_step = self._soft_label_temp_step
+        if self.soft_label_temp_min is not None and self.soft_label_K > 0:
+            progress = min(
+                self._soft_label_temp_step / self.soft_label_temp_decay_steps, 1.0
+            )
+            soft_label_temp_progress = progress
+            current_soft_label_temp = (
+                self.soft_label_temperature
+                - (self.soft_label_temperature - self.soft_label_temp_min) * progress
+            )
+            self._soft_label_temp_step += 1
+        else:
+            current_soft_label_temp = self.soft_label_temperature
+
+        # ── Compute per-position codebook loss weight decay (cosine) ──
+        # alpha_k = 0.5 * (1 + cos(pi * step / decay_steps_k))
+        # Decays from 1.0 to 0.0 over decay_steps_k forward calls.
+        # Positions without decay (None) keep alpha = 1.0.
+        codebook_weight_decay_step = self._codebook_weight_decay_step
+        per_position_alphas = []  # alpha_k for each codebook level k
+        for k in range(n_sem):
+            decay_steps_k = (
+                self.codebook_loss_weight_decay_steps[k]
+                if self.codebook_loss_weight_decay_steps is not None
+                and k < len(self.codebook_loss_weight_decay_steps)
+                and self.codebook_loss_weight_decay_steps[k] is not None
+                else None
+            )
+            if decay_steps_k is not None and decay_steps_k > 0:
+                progress_k = min(codebook_weight_decay_step / decay_steps_k, 1.0)
+                alpha_k = 0.5 * (1.0 + math.cos(math.pi * progress_k))
+            else:
+                alpha_k = 1.0
+            per_position_alphas.append(alpha_k)
+        if any(a < 1.0 for a in per_position_alphas):
+            self._codebook_weight_decay_step += 1
+
         cumulative_residual_loss = 0.0
         num_cumul_steps = 0
         if self.cumulative_residual_loss_weight > 0:
@@ -282,6 +414,7 @@ class TIGER_Residual(TIGER):
         past_key_values = None
         all_ntp_logits = []  # [n_codebook] list of [B, V]
         predicted_sids = []  # [n_codebook] list of [B] — model's own predictions for non-TF
+        prev_residual_output_latent = None  # recursive: carries hidden_resid_{k-1} in d_model space into step k
         sid_loss = 0.0
         codebook_loss = 0.0
         num_sid_steps = 0
@@ -330,11 +463,6 @@ class TIGER_Residual(TIGER):
                         device=device,
                     )
             else:
-                # ── NTP non-teacher-forcing (scheduled sampling) ──
-                # At step k > 0, the decoder normally receives GT sid_{k-1} as input.
-                # With ntp_nontf_ratio > 0, some samples use the model's predicted
-                # sid_{k-1} instead. This is standard scheduled sampling — makes the
-                # model robust to its own prediction errors during inference.
                 if self.ntp_nontf_ratio > 0 and len(predicted_sids) > 0:
                     ntp_nontf_mask = torch.rand(B, device=device) < self.ntp_nontf_ratio  # [B]
                     predicted_sid_prev = predicted_sids[-1]  # [B], predicted sid_{k-1}
@@ -350,14 +478,16 @@ class TIGER_Residual(TIGER):
                     # Teacher forcing: use ground truth sid_{k-1} as input
                     dec_input_ids = labels_sids[:, k - 1 : k]  # [B, 1]
 
+            past_key_values_kv = _kv_to_dynamic_cache(past_key_values)
             decoder_out = self.decoder(
                 input_ids=dec_input_ids,
                 encoder_hidden_states=encoder_hidden,
                 encoder_attention_mask=attention_mask,
-                past_key_values=past_key_values,
+                past_key_values=past_key_values_kv,
                 use_cache=True,
                 return_dict=True,
             )
+            # sid的输出
             hidden = decoder_out.last_hidden_state[:, -1, :]  # [B, d_model]
             past_key_values = decoder_out.past_key_values
 
@@ -369,27 +499,11 @@ class TIGER_Residual(TIGER):
             predicted_sid_k = logits.argmax(dim=-1)  # [B]
             predicted_sids.append(predicted_sid_k)
 
-            # NTP loss for sid_k — compute in FP32
-            # NOTE: NTP loss always uses GT labels as target, regardless of
-            # whether the decoder input was TF or non-TF. The loss measures
-            # "can the model predict the correct next token", which is the
-            # fundamental objective. Non-TF inputs just change the context.
             target_k = labels_sids[:, k]  # [B]
             sid_loss += F.cross_entropy(logits, target_k, reduction="sum") / B
             num_sid_steps += 1
-        
-            # === Residual position (if we need one after this level) ===
-            # We add a residual position for levels 0 through num_resid-1
+
             if k < num_resid and k + 1 < n_codebook:
-                # ── Residual non-teacher-forcing ──
-                # Normally, residual = adapter(hidden_k) - codebook_emb[k][GT_sid_k].
-                # With resid_nontf_ratio > 0, some samples use the model's predicted
-                # sid_k instead of GT sid_k for codebook index selection. This
-                # directly addresses the train-test mismatch:
-                #   - Training: residual uses GT sid_k (always correct)
-                #   - Inference: residual uses predicted sid_k (may be wrong)
-                # By mixing predicted/GT during training, the model learns to
-                # handle both "correct" and "incorrect" residuals in the KV cache.
                 if self.resid_nontf_ratio > 0:
                     resid_nontf_mask_k = torch.rand(B, device=device) < self.resid_nontf_ratio  # [B]
                     # Blend: masked samples use predicted sid_k, rest use GT sid_k
@@ -406,11 +520,13 @@ class TIGER_Residual(TIGER):
                     cb_idx_k = self._get_codebook_idx(labels_sids[:, k], k)
                 cb_emb = self.codebook_embs[k][cb_idx_k]  # [B, latent_size]
 
-                # Compute residual in codebook latent space (like RQ-VAE):
-                #   h_latent = output_adapter[k](h_k)  → latent space
-                #   residual = h_latent - embed_k(sid_k)    → latent space
-                # Cast to FP32 to prevent overflow/NaN under AMP FP16 autocast
-                h_latent = self.output_adapters[k](hidden.float())  # [B, latent_size]
+
+                if k == 0:
+                    h_latent = self.output_adapters[k](hidden.float())  # [B, latent_size]
+                else:
+                    h_latent = prev_residual_output_latent  # [B, latent_size]
+
+
                 residual = (h_latent - cb_emb.float())  # [B, latent_size]
 
                 # Clamp residual magnitude to prevent extreme values destabilizing decoder
@@ -422,11 +538,12 @@ class TIGER_Residual(TIGER):
                 residual_adapted = self.input_adapters[k](residual.to(hidden.dtype))  # [B, d_model]
                 residual_input = residual_adapted.unsqueeze(1)  # [B, 1, d_model]
 
+                past_key_values_kv = _kv_to_dynamic_cache(past_key_values)
                 decoder_out_resid = self.decoder(
                     inputs_embeds=residual_input,
                     encoder_hidden_states=encoder_hidden,
                     encoder_attention_mask=attention_mask,
-                    past_key_values=past_key_values,
+                    past_key_values=past_key_values_kv,
                     use_cache=True,
                     return_dict=True,
                 )
@@ -436,99 +553,73 @@ class TIGER_Residual(TIGER):
                 # Fall back to the NTP step's past_key_values instead
                 if not torch.isnan(hidden_resid).any():
                     past_key_values = decoder_out_resid.past_key_values
-                # else: keep past_key_values from the NTP step (no contamination)
+                
 
-                # Codebook selection CE loss: project to latent space and
-                # classify within codebook[k+1] — mirrors VQ argmin selection,
-                # not regression to a specific vector.
                 hidden_resid_latent = self.output_adapters[k + 1](hidden_resid.float())  # [B, latent_size]
+                
+                prev_residual_output_latent= hidden_resid_latent
+                # ── Inline helper: compute codebook CE loss (soft or hard) ──
+                def _compute_code_loss(pred_latent, level_k, labels_sids_batch, B_val, device_val):
+                    """
+                    Compute codebook cross-entropy loss for level (level_k + 1).
 
-                # Compute similarity logits against all codebook[k+1] entries
-                cb_weights = self.codebook_embs[k + 1]  # [codebook_size, latent_size]
-                logits_cb = hidden_resid_latent @ cb_weights.T.float()  # [B, codebook_size]
+                    Args:
+                        pred_latent: [B, latent_size] — predicted latent from output adapter
+                        level_k:     current residual level (targets codebook[level_k+1])
+                        labels_sids_batch: [B, n_codebook] — ground-truth sid tokens
+                        B_val:       batch size
+                        device_val:  torch device
 
-                # Target: correct codebook index for level k+1
-                cb_idx_next = self._get_codebook_idx(labels_sids[:, k + 1], k + 1)  # [B]
+                    Returns:
+                        scalar loss (already averaged over batch for hard-label,
+                        or mean for soft-label)
+                    """
+                    cb_weights = self.codebook_embs[level_k + 1]  # [codebook_size, latent_size]
+                    logits_cb = pred_latent @ cb_weights.T.float()  # [B, codebook_size]
+                    cb_idx_next = self._get_codebook_idx(labels_sids_batch[:, level_k + 1], level_k + 1)  # [B]
 
-                if self.soft_label_K > 0:
-                    # ── Soft-label codebook loss ──────────────────────────────
-                    # Instead of hard CE (ground truth = 1, rest = 0), we use
-                    # distance-based soft labels: the K nearest codebook entries
-                    # to the ground truth receive softmax(-dist/temp) as their
-                    # label probability, providing smooth gradient signals to
-                    # nearby entries while still emphasizing the ground truth.
-                    #
-                    # Algorithm:
-                    #   1. Compute L2 distance from each codebook entry to ground truth
-                    #   2. Select top-K nearest entries (including ground truth itself)
-                    #   3. Apply softmax(-dist/temp) over those K entries → soft_labels
-                    #   4. Compute cross-entropy: -sum(soft_labels * log_softmax(logits_cb))
-                    # ────────────────────────────────────────────────────────────
+                    if self.soft_label_K > 0:
+                        # Ground truth embedding in codebook[level_k+1]
+                        gt_emb = cb_weights[cb_idx_next].float()  # [B, latent_size]
 
-                    # Ground truth embedding in codebook[k+1]
-                    gt_emb = cb_weights[cb_idx_next].float()  # [B, latent_size]
+                        # Squared L2 distance: ||cb_weights[j] - gt_emb[b]||^2
+                        dist_sq = ((cb_weights.float().unsqueeze(0) - gt_emb.unsqueeze(1)) ** 2).sum(-1)  # [B, codebook_size]
 
-                    # Squared L2 distance: ||cb_weights[j] - gt_emb[b]||^2
-                    # cb_weights: [codebook_size, latent_size], gt_emb: [B, latent_size]
-                    dist_sq = ((cb_weights.float().unsqueeze(0) - gt_emb.unsqueeze(1)) ** 2).sum(-1)  # [B, codebook_size]
+                        # Select top-K nearest entries (smallest distance)
+                        K = min(self.soft_label_K, self.codebook_size)
+                        _, topk_indices = torch.topk(dist_sq, k=K, dim=-1, largest=False)  # [B, K]
 
-                    # Select top-K nearest entries (smallest distance)
-                    K = min(self.soft_label_K, self.codebook_size)
-                    _, topk_indices = torch.topk(dist_sq, k=K, dim=-1, largest=False)  # [B, K]
+                        # Extract distances for the top-K entries, use L2 distance (sqrt)
+                        # for better softmax scaling (squared distances are too extreme)
+                        topk_dist_sq = dist_sq.gather(1, topk_indices)  # [B, K]
+                        topk_dist = torch.sqrt(topk_dist_sq.clamp(min=1e-8))  # [B, K]
 
-                    # Extract distances for the top-K entries, use L2 distance (sqrt)
-                    # for better softmax scaling (squared distances are too extreme)
-                    topk_dist_sq = dist_sq.gather(1, topk_indices)  # [B, K]
-                    topk_dist = torch.sqrt(topk_dist_sq.clamp(min=1e-8))  # [B, K]
+                        # Softmax on negative distances / temperature:
+                        #   closer entries → higher probability
+                        #   ground truth (dist=0) → highest probability
+                        # Uses scheduled temperature (decays over training) if enabled
+                        neg_scaled_dist = -topk_dist / current_soft_label_temp  # [B, K]
+                        soft_probs_topk = F.softmax(neg_scaled_dist, dim=-1)  # [B, K], sums to 1
 
-                    # Softmax on negative distances / temperature:
-                    #   closer entries → higher probability
-                    #   ground truth (dist=0) → highest probability
-                    neg_scaled_dist = -topk_dist / self.soft_label_temperature  # [B, K]
-                    soft_probs_topk = F.softmax(neg_scaled_dist, dim=-1)  # [B, K], sums to 1
+                        # Build full soft label distribution over entire codebook
+                        soft_labels = torch.zeros(B_val, self.codebook_size, device=device_val, dtype=torch.float32)
+                        soft_labels.scatter_(1, topk_indices, soft_probs_topk)  # [B, codebook_size]
 
-                    # Build full soft label distribution over entire codebook
-                    soft_labels = torch.zeros(B, self.codebook_size, device=device, dtype=torch.float32)
-                    soft_labels.scatter_(1, topk_indices, soft_probs_topk)  # [B, codebook_size]
+                        # Cross-entropy with soft targets:
+                        #   loss = -sum(soft_labels * log_softmax(logits_cb))
+                        # This generalizes hard CE (when soft_labels is one-hot, it reduces to CE)
+                        log_probs = F.log_softmax(logits_cb, dim=-1)  # [B, codebook_size]
+                        return -(soft_labels * log_probs).sum(dim=-1).mean()
+                    else:
+                        # ── Hard-label: standard CE (original behavior) ──
+                        return F.cross_entropy(logits_cb, cb_idx_next, reduction="sum") / B_val
 
-                    # Cross-entropy with soft targets:
-                    #   loss = -sum(soft_labels * log_softmax(logits_cb))
-                    # This generalizes hard CE (when soft_labels is one-hot, it reduces to CE)
-                    log_probs = F.log_softmax(logits_cb, dim=-1)  # [B, codebook_size]
-                    codebook_loss += -(soft_labels * log_probs).sum(dim=-1).mean()
-
-                    # ── Debug log: check soft-label sharpness ────────────────
-                    if self._soft_label_log_step % self._soft_label_log_interval == 0:
-                        n_show = min(10, B)
-                        max_prob = soft_probs_topk[:n_show, 0].detach()   # rank-0 = GT (dist=0)
-                        min_prob = soft_probs_topk[:n_show, -1].detach()  # rank-(K-1) = farthest
-                        print(
-                            f"\n[SoftLabel] step={self._soft_label_log_step} "
-                            f"level k→k+1: {k}→{k+1}  temp={self.soft_label_temperature}  K={K}"
-                        )
-                        print(f"  {'sample':>6}  {'gt_idx':>6}  {'max_p':>7}  {'min_p':>7}  "
-                              f"{'topK_dists (L2)':>40s}")
-                        for i in range(n_show):
-                            dists_str = "  ".join(f"{topk_dist[i, j].item():.2f}" for j in range(K))
-                            print(
-                                f"  {i:>6}  {topk_indices[i, 0].item():>6}  "
-                                f"{max_prob[i].item():>7.4f}  {min_prob[i].item():>7.4f}  "
-                                f"{dists_str:>40s}"
-                            )
-                        print()  # blank line after the block
-                    self._soft_label_log_step += 1
-                    # ───────────────────────────────────────────────────────────
-                else:
-                    # ── Hard-label: standard CE (original behavior) ──
-                    codebook_loss += F.cross_entropy(logits_cb, cb_idx_next, reduction="sum") / B
+                codebook_loss += _compute_code_loss(hidden_resid_latent, k, labels_sids, B, device) * per_position_alphas[k + 1]
                 num_codebook_steps += 1
+                if k==0: #上面算的是第1级，现在需要算一下第第0级的loss
+                    codebook_loss+=_compute_code_loss(h_latent,k-1,labels_sids,B,device) * per_position_alphas[0]
+                    num_codebook_steps += 1
 
-                # ---- Cumulative residual constraint (optional) ----
-                # Constrain output_adapter[k+1](hidden_resid_k) to be close to the
-                # cumulative sum of all remaining codebook embeddings. This enforces
-                # that the residual representation encodes the *full* remaining
-                # content, not just the next codebook index. Complementary to the
-                # classification-based codebook loss above.
                 if self.cumulative_residual_loss_weight > 0:
                     target_cumul = cumsum_gt[k + 1]  # [B, latent_size]: sum of codes k+1..n-1
                     if self.cumulative_residual_loss_type == "cosine":
@@ -536,6 +627,13 @@ class TIGER_Residual(TIGER):
                             hidden_resid_latent, target_cumul, dim=-1
                         )
                         cumulative_residual_loss += (1.0 - cos_sim).sum() / B
+                    elif self.cumulative_residual_loss_type == "ce":
+                        sim_matrix = hidden_resid_latent @ target_cumul.T  # [B, B]
+                        sim_matrix = sim_matrix / self.cumulative_residual_loss_temperature
+                        labels_ce = torch.arange(B, device=device)
+                        cumulative_residual_loss += F.cross_entropy(
+                            sim_matrix, labels_ce, reduction="mean"
+                        )
                     else:
                         cumulative_residual_loss += F.mse_loss(
                             hidden_resid_latent, target_cumul, reduction="sum"
@@ -555,6 +653,20 @@ class TIGER_Residual(TIGER):
         # Stack NTP logits: [B, n_codebook, vocab_size]
         stacked_logits = torch.stack(all_ntp_logits, dim=1)
 
+        # ── Debug log: soft-label temperature scheduling ──
+        if self.soft_label_temp_min is not None and self.soft_label_K > 0:
+            if self._soft_label_log_step % self._soft_label_log_interval == 0:
+                progress_pct = min(
+                    (self._soft_label_temp_step - 1) / self.soft_label_temp_decay_steps * 100, 100.0
+                )
+                print(
+                    f"\n[TempSchedule] step={self._soft_label_temp_step} "
+                    f"T={current_soft_label_temp:.4f} "
+                    f"(init={self.soft_label_temperature:.2f} → min={self.soft_label_temp_min:.2f}, "
+                    f"progress={progress_pct:.1f}%)"
+                )
+            self._soft_label_log_step += 1
+
         # ── Debug log: non-TF statistics ──
         if (self.resid_nontf_ratio > 0 or self.ntp_nontf_ratio > 0):
             if self._nontf_log_step % self._nontf_log_interval == 0:
@@ -569,6 +681,20 @@ class TIGER_Residual(TIGER):
                 )
             self._nontf_log_step += 1
 
+        # ── Debug log: codebook weight decay ──
+        if self.codebook_loss_weight_decay_steps is not None:
+            if not hasattr(self, '_cb_weight_decay_log_step'):
+                self._cb_weight_decay_log_step = 0
+                self._cb_weight_decay_log_interval = 50
+            if self._cb_weight_decay_log_step % self._cb_weight_decay_log_interval == 0:
+                alpha_str = ", ".join(
+                    f"k{k}:α={per_position_alphas[k]:.3f}" for k in range(n_sem)
+                )
+                print(
+                    f"\n[CBWeightDecay] step={codebook_weight_decay_step} {alpha_str}"
+                )
+            self._cb_weight_decay_log_step += 1
+
         return {
             "loss": total_loss,
             "sid_loss": sid_loss,
@@ -578,6 +704,11 @@ class TIGER_Residual(TIGER):
             "predicted_embedding": self.predicted_embedding,
             "nontf_resid_pct": nontf_resid_count / nontf_resid_total if nontf_resid_total > 0 else 0.0,
             "nontf_ntp_pct": nontf_ntp_count / nontf_ntp_total if nontf_ntp_total > 0 else 0.0,
+            "current_soft_label_temp": current_soft_label_temp,
+            "soft_label_temp_progress": soft_label_temp_progress,
+            "soft_label_temp_step": soft_label_temp_step,
+            "codebook_weight_decay_step": codebook_weight_decay_step,
+            "per_position_alphas": per_position_alphas,
         }
 
     @staticmethod
@@ -585,10 +716,13 @@ class TIGER_Residual(TIGER):
         """
         Reorder past_key_values for beam search.
 
-        T5's past_key_values is a tuple of tuples:
-            ((key_0, value_0), (key_1, value_1), ..., (key_L, value_L))
-        Each key/value has shape [batch, num_heads, seq_len, head_dim].
+        Supports both tuple format and DynamicCache (transformers >= 4.44).
         """
+        # DynamicCache path
+        if hasattr(past_key_values, 'get_seq_length'):
+            past_key_values.reorder_cache(beam_idx)
+            return past_key_values
+        # Tuple path: ((key_0, value_0), (key_1, value_1), ...)
         reordered = ()
         for layer_past in past_key_values:
             reordered += (
@@ -664,7 +798,7 @@ class TIGER_Residual(TIGER):
 
         # ── Encode ──
         if inputs_embeds is not None:
-            enr_outputs = self.encoder(
+            encoder_outputs = self.encoder(
                 inputs_embeds=inputs_embeds,
                 attention_mask=attention_mask,
                 return_dict=True,
@@ -697,6 +831,7 @@ class TIGER_Residual(TIGER):
 
         past_key_values = None
         generated_sids = []  # list of [B * n_beams, 1] tensors
+        prev_residual_output_latent = None  # recursive: carries output_adapter result in latent space
 
         # ── BOS-only step: build holistic object representation (no SID decoding) ──
         if self.flag_separate_bos_representation:
@@ -738,11 +873,12 @@ class TIGER_Residual(TIGER):
             else:
                 dec_input_ids = generated_sids[-1]  # [B * n_beams, 1]
 
+            past_key_values_kv = _kv_to_dynamic_cache(past_key_values)
             decoder_out = self.decoder(
                 input_ids=dec_input_ids,
                 encoder_hidden_states=encoder_hidden,
                 encoder_attention_mask=attention_mask,
-                past_key_values=past_key_values,
+                past_key_values=past_key_values_kv,
                 use_cache=True,
                 return_dict=True,
             )
@@ -782,6 +918,10 @@ class TIGER_Residual(TIGER):
             # Reorder hidden states (needed for residual computation)
             hidden = hidden[reorder_indices]  # [B * n_beams, d_model]
 
+            # Reorder prev_residual_output_latent to match new beam order (needed for recursive residual)
+            if prev_residual_output_latent is not None:
+                prev_residual_output_latent = prev_residual_output_latent[reorder_indices]  # [B * n_beams, latent_size]
+
             # Store new sid_k
             sid_k = chosen_tokens.reshape(-1, 1)  # [B * n_beams, 1]
             generated_sids.append(sid_k)
@@ -797,18 +937,25 @@ class TIGER_Residual(TIGER):
                 )  # [B * n_beams]
                 cb_emb = self.codebook_embs[k][cb_idx_k]  # [B * n_beams, latent_size]
 
-                # Compute residual in codebook latent space (like RQ-VAE)
-                h_latent = self.output_adapters[k](hidden)  # [B * n_beams, latent_size]
+                # Compute residual in codebook latent space (recursive, like RQ-VAE):
+                #   k=0: residual_0 = output_adapter[0](hidden_0) - embed_0(sid_0)
+                #   k>0: residual_k = prev_residual_output_latent - embed_k(sid_k)
+                #   (prev_residual_output_latent is output_adapter[k+1](hidden_resid) from step k-1)
+                if k == 0:
+                    h_latent = self.output_adapters[k](hidden.float())  # [B * n_beams, latent_size]
+                else:
+                    h_latent = prev_residual_output_latent  # [B * n_beams, latent_size]
                 residual = h_latent - cb_emb  # [B * n_beams, latent_size]
 
                 # Map residual from latent space to backbone d_model space via input adapter
                 residual_adapted = self.input_adapters[k](residual)  # [B * n_beams, d_model]
 
+                past_key_values_kv = _kv_to_dynamic_cache(past_key_values)
                 dec_out_resid = self.decoder(
                     inputs_embeds=residual_adapted.unsqueeze(1),
                     encoder_hidden_states=encoder_hidden,
                     encoder_attention_mask=attention_mask,
-                    past_key_values=past_key_values,
+                    past_key_values=past_key_values_kv,
                     use_cache=True,
                     return_dict=True,
                 )
@@ -821,10 +968,14 @@ class TIGER_Residual(TIGER):
                     past_key_values = past_key_values  # keep from NTP step
                     continue  # skip beam expansion for this step
 
+                # Store output_adapter result for recursive residual computation at next step
+                hidden_resid_latent = self.output_adapters[k + 1](hidden_resid.float())  # [B * n_beams, latent_size]
+                prev_residual_output_latent = hidden_resid_latent
+
                 if n_resid_beams > 1:
                     # Compute codebook[k+1] classification logits from hidden_resid
                     # (same computation as in forward_residual's codebook_loss)
-                    hidden_resid_latent = self.output_adapters[k + 1](hidden_resid.float())  # [B*n_beams, latent_size]
+                    # hidden_resid_latent already computed above
                     cb_weights_next = self.codebook_embs[k + 1]  # [codebook_size, latent_size]
                     cb_logits = hidden_resid_latent @ cb_weights_next.T.float()  # [B*n_beams, codebook_size]
                     cb_log_probs = F.log_softmax(cb_logits, dim=-1)  # [B*n_beams, codebook_size]
@@ -881,6 +1032,9 @@ class TIGER_Residual(TIGER):
                     # Reorder ALL generated sids to match new beam order
                     for i in range(len(generated_sids)):
                         generated_sids[i] = generated_sids[i][reorder_idx_resid]
+                    # Reorder prev_residual_output_latent to match new beam order
+                    if prev_residual_output_latent is not None:
+                        prev_residual_output_latent = prev_residual_output_latent[reorder_idx_resid]
                 else:
                     # resid_beams=1: greedy pass-through (original behavior)
                     past_key_values = kv_after_resid

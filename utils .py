@@ -7,6 +7,7 @@
 
 
 import copy
+import importlib.util
 import os
 import random
 
@@ -54,7 +55,10 @@ class WandbManager:
         wandb_dir = configs["output_path"]
         os.makedirs(wandb_dir, exist_ok=True)
 
-        args_dict = OmegaConf.to_container(configs)
+        if isinstance(configs, dict):
+            args_dict = configs
+        else:
+            args_dict = OmegaConf.to_container(configs)
         self._wandb.init(
             # set the wandb project where this run will be logged
             project=project_name,

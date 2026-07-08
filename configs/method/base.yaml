@@ -7,14 +7,41 @@ flag_use_output_embedding: False
 
 embedding_loss_weight: 0
 sid_loss_weight: 1
-
+use_simple_residual: False
 use_residual_decoder: False
+use_softlabel_sid: False                # True → TIGER_SoftLabel (soft labels from codebook distance, no residual)
+                                         # This isolates the soft label effect from the residual information effect.
+                                         # Compare: TIGER (hard) vs TIGER_SoftLabel (soft, no residual) vs TIGER_Residual (soft + residual)
+use_letter_tokenizer: False             # True → use LETTER tokenizer (Sinkhorn+Div+CF) instead of EMA RQ-VAE
+                                         # The backbone model is still TIGER. Only the tokenizer differs.
+letter_cf_embedding_path: null           # Path to CF embeddings for LETTER CF alignment loss.
+                                         # If null, LETTER trains without CF loss (alpha effectively 0).
 codebook_loss_weight: 1.0
+codebook_loss_weight_decay_steps: null   # Per-position codebook loss weight decay schedule.
+                                        # null = no decay for any position (backward compatible).
+                                        # list of (int or null) per codebook level, e.g. [5000, null, null, null]
+                                        #   → k=0 decays over 5000 steps, k>=1 stays fixed.
+                                        # Uses cosine decay: weight decays from codebook_loss_weight to 0.
+                                        # This implements "training wheel removal" — early positions benefit
+                                        # from auxiliary loss initially but may be hurt later when the soft
+                                        # label's imperfect nearest-neighbors become a ceiling. Cosine decay
+                                        # keeps weight high early (accelerating convergence) then rapidly
+                                        # withdraws the auxiliary signal in mid-training, allowing the NTP
+                                        # loss to optimize freely by the end.
+                                        # Each forward_residual call counts as one step.
 num_residual_levels: null
 soft_label_K: 0          # 0 = hard label (original CE); >0 = soft-label top-K nearest codebook entries
 soft_label_temperature: 1.0  # temperature for softmax on -dist; higher = more uniform, lower = sharper
-cumulative_residual_loss_weight: 0.0    # 0=disabled; >0 adds MSE constraint: residual output ≈ sum of remaining codes
-cumulative_residual_loss_type: "mse"    # "mse" for L2 regression, "cosine" for cosine similarity loss
+soft_label_temp_min: null        # minimum temperature for scheduling (linear decay from soft_label_temperature to this value).
+                                 # null = no scheduling (temperature stays fixed at soft_label_temperature).
+                                 # As training progresses, temperature decreases → distribution gets sharper.
+                                 # Only used when soft_label_K > 0.
+soft_label_temp_decay_steps: 10000  # total forward steps over which temperature decays from init to min.
+                                     # Each forward_residual call counts as one step.
+                                     # Only used when soft_label_temp_min is not null.
+cumulative_residual_loss_weight: 0.0    # 0=disabled; >0 adds constraint: residual output ≈ sum of remaining codes
+cumulative_residual_loss_type: "mse"    # "mse" for L2 regression, "cosine" for cosine similarity, "ce" for batch-wise cross-entropy (InfoNCE)
+cumulative_residual_loss_temperature: 1.0  # temperature for "ce" loss; scales inner-product logits before softmax
 resid_beams: null                       # null=same as num_beams; 1=greedy pass-through (original)
 resid_score_weight: 1.0                 # weight for codebook logits when combining with beam scores at residual positions
 resid_beam_mode: "pruning"              # "pruning" (default): at most 1 candidate per parent beam → unique SID prefixes;
@@ -26,7 +53,56 @@ flag_separate_bos_representation: False  # if True, <BOS> only builds object rep
                                           # and a separate <SID_START> token triggers sid_0 generation.
                                           # This decouples "understanding" from "generating" in the decoder.
 
+# ── Continue Training (two-phase: adapter warm-up → joint fine-tuning) ──────
+# When continue_from_tiger_checkpoint is set, the training pipeline loads a
+# pre-trained TIGER (or TIGER_Residual) checkpoint as initialization and
+# performs a two-phase schedule:
+#   Phase 1 — Adapter Warm-up: Backbone (T5 encoder/decoder, embeddings, etc.)
+#            is FROZEN; only adapter layers (input_adapters, output_adapters)
+#            and newly added parameters are trained. This lets adapters adapt
+#            to the frozen backbone representation before joint fine-tuning.
+#   Phase 2 — Joint Fine-tuning: ALL parameters are unfrozen. The backbone
+#            uses a lower learning rate (lr × backbone_lr_factor) to avoid
+#            catastrophic forgetting, while adapters keep the base lr.
+# If adapter_warmup_steps=0, Phase 1 is skipped and training starts directly
+# in Phase 2 (joint fine-tuning with differential learning rates).
+continue_from_tiger_checkpoint: null     # Path to a trained TIGER model checkpoint (.pt or ckpt_best.pt).
+                                          # When set, loads backbone weights and enables two-phase training.
+                                          # The checkpoint can be from:
+                                          #   - Base TIGER model (loads backbone, adapters initialized randomly)
+                                          #   - TIGER_Residual model (loads backbone + adapters, continues training)
+adapter_warmup_steps: 0                  # Number of training steps for Phase 1 (adapter warm-up).
+                                          # During warm-up, backbone is frozen → only adapters train.
+                                          # 0 = skip warm-up, go directly to joint training (Phase 2).
+backbone_lr_factor: 0.1                  # Backbone LR multiplier in Phase 2 (joint fine-tuning).
+                                          # backbone_lr = base_lr × backbone_lr_factor.
+                                          # Lower values (e.g., 0.1) prevent catastrophic forgetting of
+                                          # pre-trained backbone knowledge while allowing adaptation.
+adapter_lr_factor: 1.0                   # Adapter LR multiplier in Phase 2 (joint fine-tuning).
+                                          # adapter_lr = base_lr × adapter_lr_factor.
+                                          # 1.0 = same as base lr; >1.0 = higher lr for adapters.
+
 evaluation_method: "default"
+
+# ── MA-LIGER: Memory-Augmented Prototype ────────────────────────────────────
+# When use_prototype=True, the model uses VQ Prototype Memory + Cross-Attention
+# to augment the encoder hidden states with group-level interest patterns.
+# This requires a two-stage training:
+#   Stage 1: Standard LIGER training (use_prototype=false)
+#   Stage 2: Load Stage 1 checkpoint, init Prototype via K-Means, joint fine-tune
+use_prototype: False
+prototype:
+  K: 256                  # Number of prototypes (interest patterns)
+  p: 3                    # Number of nearest prototypes to retrieve (Top-p)
+  L: 8                    # Number of interest tokens per prototype (latent vectors)
+  beta: 0.25              # Commitment loss weight (VQ-VAE standard)
+  delta: 0.1              # Diversity loss weight (entropy regularization, anti-collapse)
+  ema_decay: 0.99          # EMA decay for prototype token updates
+  n_heads: 8              # Number of attention heads in Cross-Attention layer
+  gate_hidden: 64         # Hidden dimension for Confidence Gate MLP
+  dropout: 0.1             # Dropout in Cross-Attention layer
+  stage1_checkpoint: null  # Path to Stage 1 LIGER checkpoint (required for Stage 2)
+  encoder_lr_factor: 0.1  # Encoder LR multiplier in Stage 2 (slow, avoid representation drift); Decoder uses full lr
 
 embedding_head_dict:
   use_new_init: False

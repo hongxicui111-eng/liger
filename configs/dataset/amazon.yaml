@@ -28,6 +28,72 @@ RQ-VAE:
   code_book_size: 256
   max_seq_len: 256
   val_ratio: 0.05
+  num_workers: 4            # DataLoader parallel workers (0 = main thread, >0 = faster data loading)
+
+# LETTER RQ-VAE tokenizer config
+# Key differences from RQ-VAE:
+#   - Uses Sinkhorn-balanced assignment (sk_epsilons) for balanced codebook usage
+#   - Diversity loss (beta) for diverse codebook entries
+#   - CF alignment loss (alpha) to align with collaborative filtering signals
+#   - Supports constrained k-means initialization (kmeans_init)
+#   - Each VQ layer can have its own codebook size (num_emb_list)
+LETTER:
+  optimizer: AdamW
+  weight_decay: 1e-4
+  batch_size: 1024
+  epochs: 20000
+  lr: 1e-3
+  eval_step: 2000
+  patience: 5              # Early stopping patience (in eval_step units). 5 × 2000 = 10000 epochs max wait
+  input_dim: 768          # Must match content_model embedding dim
+  hidden_dim:
+    - 2048
+    - 1024
+    - 512
+    - 256
+    - 128
+    - 64
+  latent_dim: 32           # LETTER uses smaller latent dim (e.g., 32) vs RQ-VAE (128)
+  num_emb_list:            # Codebook size per VQ layer (can differ per layer)
+    - 256
+    - 256
+    - 256
+    - 256
+  dropout: 0.0
+  bn: false                # Whether to use batch normalization
+  loss_type: "mse"
+  quant_loss_weight: 1.0
+  kmeans_init: true        # Use constrained k-means for codebook initialization
+  kmeans_iters: 100
+  sk_epsilons:             # Sinkhorn epsilons per layer (0 = disabled, >0 = balanced assignment)
+    - 0.0                  # Layer 0: no Sinkhorn (greedy assignment)
+    - 0.0                  # Layer 1: no Sinkhorn
+    - 0.0                  # Layer 2: no Sinkhorn
+    - 0.003                # Layer 3: light Sinkhorn for collision resolution
+  sk_iters: 50             # Sinkhorn iterations
+  alpha: 0.1               # CF loss weight (0 = no CF alignment)
+  beta: 0.1                # Diversity loss weight
+  n_clusters: 10           # Number of clusters for constrained k-means (diversity loss)
+  val_ratio: 0.05
+
+# SASRec: Self-Attentive Sequential Recommendation
+# Used to generate CF (Collaborative Filtering) embeddings for LETTER's alignment loss.
+# The CF embeddings capture user behavior patterns (collaborative signals) that complement
+# the content-based semantic embeddings from sentence-T5.
+# When test_method=letter, SASRec is auto-trained if CF embeddings don't already exist.
+SASRec:
+  hidden_units: 32        # Item embedding dimension. Should match LETTER.latent_dim for CF loss.
+                          # Original LETTER paper uses 32. Must be consistent with LETTER config.
+  num_heads: 2           # Number of self-attention heads
+  num_blocks: 2          # Number of self-attention blocks
+  max_len: 50            # Maximum sequence length
+  dropout: 0.2           # Dropout rate
+  epochs: 200            # Training epochs (SASRec converges fast on typical datasets)
+  lr: 0.001              # Learning rate
+  batch_size: 128        # Training batch size
+  weight_decay: 0.0      # L2 regularization
+  eval_steps: 10         # Log loss every N epochs
+  patience: 20           # Early stopping patience (in eval_steps units)
 
 TIGER:
   n_positions: 102
