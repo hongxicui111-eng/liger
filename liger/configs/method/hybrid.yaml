@@ -1,0 +1,40 @@
+defaults:
+  - base
+
+# Hybrid generative-prefix + dense retrieval method.
+#
+# The generative (T5) model is only trained to autoregressively predict the
+# first `prefix_depth` semantic ids (the "prefix"). After the prefix is
+# generated, a dense retriever ranks the candidate items that fall under that
+# prefix (prefix -> item-set mapping).
+#
+# Unlike the original liger method, we do NOT append an extra sid to resolve sid
+# collisions: collisions inside a prefix bucket are resolved by the dense
+# retriever instead.
+flag_add_input_embedding: True
+flag_use_output_embedding: True
+
+embedding_loss_weight: 1
+sid_loss_weight: 1
+
+# "hybrid" = generate prefix, then dense-retrieve within the prefix bucket.
+evaluation_method: "hybrid"
+
+# Do not add the extra (4th) conflict-resolution sid: keep the 3 RQ-VAE codebooks.
+use_extra_sid: False
+# The generative model only predicts the first `prefix_depth` sids.
+# Valid values: 2 or 3 (must be <= n_semantic_codebook).
+prefix_depth: 2
+# Number of beam prefixes generated per sample at evaluation time; the dense
+# retriever ranks the union of their prefix buckets. Larger -> denser retrieval
+# has a bigger candidate pool to rank (closer to the liger 100-candidate setup).
+hybrid_num_candidates: 100
+
+embedding_head_dict:
+  normalize_logits: True  # flag_use_output_embedding: True
+  logits_temperature: 0.07  # flag_use_output_embedding: True
+
+  text_embedding_dim: 768  # flag_add_input_embedding: True
+  hidden_sizes: [256, 512, 768]  # flag_add_input_embedding: True
+  embd_proj_dropout_rate: 0.5  # flag_add_input_embedding: True
+  embd_proj_in_dropout_rate: 0.2  # flag_add_input_embedding: True

@@ -1,0 +1,27 @@
+include_user_id: False
+use_id: "sid"
+
+# Hybrid generative-prefix + dense retrieval options
+# use_extra_sid: if True, append an extra (4th) sid to avoid sid collisions
+#                 (original liger behaviour). If False, keep only the 3 RQ-VAE
+#                 codebooks and rely on dense retrieval to disambiguate.
+use_extra_sid: True
+# prefix_depth: number of leading sids the generative model is trained to predict.
+#               0 means "predict all n_codebook sids" (backward compatible).
+#               Set to 2 or 3 for the hybrid method (generative prefix -> dense).
+prefix_depth: 0
+
+# model training
+flag_add_input_embedding: False
+flag_use_output_embedding: False
+
+embedding_loss_weight: 0
+sid_loss_weight: 1
+
+evaluation_method: "default"
+
+embedding_head_dict:
+  use_new_init: False
+  embed_target: ground_truth
+  embed_proj_type: mlp
+
