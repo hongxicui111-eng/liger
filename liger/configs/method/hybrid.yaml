@@ -29,6 +29,20 @@ prefix_depth: 2
 # retriever ranks the union of their prefix buckets. Larger -> denser retrieval
 # has a bigger candidate pool to rank (closer to the liger 100-candidate setup).
 hybrid_num_candidates: 100
+# Dense loss negative sampling:
+#   "full"   (default, liger-style): project every seen item, softmax over the
+#            whole library. Strong retrieval signal, ~500MB-1GB activation per
+#            step. Use this when dense quality matters more than speed.
+#   "bucket" (ablation): only rank items inside the target's prefix bucket.
+#            Fast and train/eval-aligned, but weak negatives -> dense head under-
+#            trains. Kept for experiments.
+dense_loss_mode: "full"
+# Auxiliary bucket contrastive loss weight. On top of the full-library dense
+# loss, adds a bucket-only CE that aligns the dense head with the evaluation
+# candidate set (eval ranks items inside the target's prefix bucket). Set to 0
+# to disable; set to 1.0 to give it equal weight with the full-library loss.
+# Check `train/bucket_loss` vs `train/embedding_loss` on wandb to tune.
+bucket_loss_weight: 0.0
 
 embedding_head_dict:
   normalize_logits: True  # flag_use_output_embedding: True

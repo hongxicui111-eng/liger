@@ -117,6 +117,46 @@ def build_prefix2items(item2sid, prefix_depth):
     return prefix2items
 
 
+def build_prefix_lookup(prefix2items, n_items):
+    """
+    Convert the ``prefix -> items`` dict into padded tensors for vectorized
+    per-batch bucket lookup (used by the hybrid dense-retrieval loss to restrict
+    negatives to the target's prefix bucket).
+
+    :return: (item_to_prefix_id, prefix_buckets_padded)
+        - item_to_prefix_id: [n_items] int64, maps each 0-based item index to its
+          prefix id (0..n_prefixes-1).
+        - prefix_buckets_padded: [n_prefixes, K_max] int64, each row is the
+          0-based item indices of that prefix bucket, padded with the bucket's
+          own first item (so duplicate writes during scatter are harmless).
+    """
+    prefix_list = list(prefix2items.keys())
+    n_prefixes = len(prefix_list)
+    prefix_to_id = {p: i for i, p in enumerate(prefix_list)}
+
+    item_to_prefix_id = np.zeros(n_items, dtype=np.int64)
+    buckets = []
+    k_max = 1
+    for p in prefix_list:
+        items = prefix2items[p]  # python list of 0-based item indices
+        item_to_prefix_id[items] = prefix_to_id[p]
+        buckets.append(items)
+        if len(items) > k_max:
+            k_max = len(items)
+
+    prefix_buckets_padded = np.zeros((n_prefixes, k_max), dtype=np.int64)
+    for i, b in enumerate(buckets):
+        if len(b) > 0:
+            prefix_buckets_padded[i, : len(b)] = b
+            # pad the tail with the bucket's first item: a duplicate scatter
+            # write to an already-True position is harmless.
+            prefix_buckets_padded[i, len(b) :] = b[0]
+
+    return torch.from_numpy(item_to_prefix_id), torch.from_numpy(
+        prefix_buckets_padded
+    )
+
+
 def generate_input_sequence(
     user_id,
     user_sequence,

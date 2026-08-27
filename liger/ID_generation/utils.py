@@ -29,7 +29,7 @@ def process_embeddings(
         item_id_2_text[int(k)] = v
 
     if os.path.exists(embedding_save_path):
-        item_embedding = torch.load(embedding_save_path, weights_only=False)
+        item_embedding = torch.load(embedding_save_path, weights_only=False).to(device)
 
     else:
         print("Embeddings not found, generating embeddings...")

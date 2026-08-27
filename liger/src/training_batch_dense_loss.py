@@ -30,7 +30,7 @@ from .evaluation import (
     get_target_embed,
     model_forward,
 )
-from .load_data import build_prefix2items, build_prefix_lookup, load_data
+from .load_data import build_prefix2items, load_data
 from .tiger import TIGER
 
 
@@ -62,8 +62,6 @@ def evaluate_helper(
         return logs
 
     def _evaluate(logs, dataloader, name):
-        recall_dict = None
-        ndcg_dict = None
         if method_config["sid_loss_weight"] > 0:
             recall_dict, ndcg_dict, returned_cand, returned_embd = evaluate(
                 model,
@@ -80,11 +78,9 @@ def evaluate_helper(
         else:
             returned_cand = None
             returned_embd = None
-        return logs, returned_cand, returned_embd, recall_dict, ndcg_dict
+        return logs, returned_cand, returned_embd
 
     def _dense_evaluate(logs, dataloader, name):
-        recall_dict = None
-        ndcg_dict = None
         if method_config["embedding_loss_weight"] > 0:
             if method_config["use_id"] == "item_id":
                 recall_dict, ndcg_dict = evaluate_dense_ids(
@@ -109,12 +105,10 @@ def evaluate_helper(
             for key in recall_dict.keys():
                 logs = add_log(logs, recall_dict[key], f"Recall@{key}", name)
                 logs = add_log(logs, ndcg_dict[key], f"NDCG@{key}", name)
-        return logs, recall_dict, ndcg_dict
+        return logs
 
     def _hybrid_evaluate(logs, dataloader, name):
         # hybrid: generate a prefix, then dense-retrieve within the prefix bucket
-        recall_dict = None
-        ndcg_dict = None
         if (
             method_config["evaluation_method"] == "hybrid"
             and method_config["embedding_loss_weight"] > 0
@@ -134,11 +128,9 @@ def evaluate_helper(
             for key in recall_dict.keys():
                 logs = add_log(logs, recall_dict[key], f"Recall@{key}", name)
                 logs = add_log(logs, ndcg_dict[key], f"NDCG@{key}", name)
-        return logs, recall_dict, ndcg_dict
+        return logs
 
     def _unified_evaluate(logs, dataloader, returned_cand, returned_embd, name):
-        recall_dict = None
-        ndcg_dict = None
         if (
             method_config["embedding_loss_weight"] > 0
             and method_config["sid_loss_weight"] > 0
@@ -170,39 +162,6 @@ def evaluate_helper(
                         f"Gen{_retrieve_key}_NDCG@{key}",
                         name,
                     )
-        return logs, recall_dict, ndcg_dict
-
-    def _add_total_metrics(logs, recall_in, ndcg_in, recall_cold, ndcg_cold, name):
-        """Pool per-sample metrics from in_set and cold_start to compute total."""
-        if recall_in is None or recall_cold is None:
-            return logs
-        for key in recall_in:
-            total_recall = recall_in[key] + recall_cold[key]
-            total_ndcg = ndcg_in[key] + ndcg_cold[key]
-            logs = add_log(logs, total_recall, f"Recall@{key}", name)
-            logs = add_log(logs, total_ndcg, f"NDCG@{key}", name)
-        return logs
-
-    def _add_total_metrics_unified(
-        logs, recall_in, ndcg_in, recall_cold, ndcg_cold, name
-    ):
-        """Pool per-sample unified metrics (nested by retrieve_key) from in_set and cold."""
-        if recall_in is None or recall_cold is None:
-            return logs
-        for _retrieve_key in recall_in:
-            for key in recall_in[_retrieve_key]:
-                total_recall = (
-                    recall_in[_retrieve_key][key] + recall_cold[_retrieve_key][key]
-                )
-                total_ndcg = (
-                    ndcg_in[_retrieve_key][key] + ndcg_cold[_retrieve_key][key]
-                )
-                logs = add_log(
-                    logs, total_recall, f"Gen{_retrieve_key}_Recall@{key}", name
-                )
-                logs = add_log(
-                    logs, total_ndcg, f"Gen{_retrieve_key}_NDCG@{key}", name
-                )
         return logs
 
     # Hybrid method: only run the prefix-then-dense evaluation (skip the
@@ -211,23 +170,14 @@ def evaluate_helper(
 
     if is_hybrid:
         if "test" in keyword:
-            logs, recall_in, ndcg_in = _hybrid_evaluate(
+            logs = _hybrid_evaluate(
                 logs, val_dataloader_dict["in_set"], f"hybrid_in_{keyword}"
             )
-            logs, recall_cold, ndcg_cold = _hybrid_evaluate(
+            logs = _hybrid_evaluate(
                 logs, val_dataloader_dict["cold_start"], f"hybrid_cold_{keyword}"
             )
-            # Report total metrics on the full test set (in_set + cold_start)
-            logs = _add_total_metrics(
-                logs,
-                recall_in,
-                ndcg_in,
-                recall_cold,
-                ndcg_cold,
-                f"hybrid_total_{keyword}",
-            )
         else:
-            logs, _, _ = _hybrid_evaluate(
+            logs = _hybrid_evaluate(
                 logs, val_dataloader_dict["in_set"], f"hybrid_in_{keyword}"
             )
 
@@ -235,72 +185,43 @@ def evaluate_helper(
         return logs, ndcg_at_10
 
     if "test" in keyword:
-        logs, returned_cand_in, returned_embd_in, recall_in, ndcg_in = _evaluate(
+        logs, returned_cand_in, returned_embd_in = _evaluate(
             logs, val_dataloader_dict["in_set"], f"genret_in_{keyword}"
         )
-        logs, returned_cand_cold, returned_embd_cold, recall_cold, ndcg_cold = (
-            _evaluate(
-                logs, val_dataloader_dict["cold_start"], f"genret_cold_{keyword}"
-            )
-        )
-        # Report total generative retrieval metrics on the full test set
-        logs = _add_total_metrics(
-            logs,
-            recall_in,
-            ndcg_in,
-            recall_cold,
-            ndcg_cold,
-            f"genret_total_{keyword}",
+        logs, returned_cand_cold, returned_embd_cold = _evaluate(
+            logs, val_dataloader_dict["cold_start"], f"genret_cold_{keyword}"
         )
 
         if method_config["flag_use_output_embedding"]:
-            logs, dense_recall_in, dense_ndcg_in = _dense_evaluate(
+            logs = _dense_evaluate(
                 logs, val_dataloader_dict["in_set_embd"], f"dense_in_{keyword}"
             )
     else:  # during training, do selected eval
-        logs, returned_cand_in, returned_embd_in, _, _ = _evaluate(
+        logs, returned_cand_in, returned_embd_in = _evaluate(
             logs, val_dataloader_dict["in_set"], f"genret_in_{keyword}"
         )
         if method_config["flag_use_output_embedding"]:
-            logs, _, _ = _dense_evaluate(
+            logs = _dense_evaluate(
                 logs, val_dataloader_dict["in_set_embd"], f"dense_in_{keyword}"
             )
 
     if method_config["flag_use_output_embedding"] and "test" in keyword:
-        logs, dense_recall_cold, dense_ndcg_cold = _dense_evaluate(
+        logs = _dense_evaluate(
             logs, val_dataloader_dict["cold_start_embd"], f"dense_cold_{keyword}"
         )
-        # Report total dense retrieval metrics on the full test set
-        logs = _add_total_metrics(
-            logs,
-            dense_recall_in,
-            dense_ndcg_in,
-            dense_recall_cold,
-            dense_ndcg_cold,
-            f"dense_total_{keyword}",
-        )
-        logs, uni_recall_in, uni_ndcg_in = _unified_evaluate(
+        logs = _unified_evaluate(
             logs,
             val_dataloader_dict["in_set"],
             returned_cand_in,
             returned_embd_in,
             f"uni_in_{keyword}",
         )
-        logs, uni_recall_cold, uni_ndcg_cold = _unified_evaluate(
+        logs = _unified_evaluate(
             logs,
             val_dataloader_dict["cold_start"],
             returned_cand_cold,
             returned_embd_cold,
             f"uni_cold_{keyword}",
-        )
-        # Report total unified retrieval metrics on the full test set
-        logs = _add_total_metrics_unified(
-            logs,
-            uni_recall_in,
-            uni_ndcg_in,
-            uni_recall_cold,
-            uni_ndcg_cold,
-            f"uni_total_{keyword}",
         )
 
     if (
@@ -332,13 +253,8 @@ def train_epoch(
     method_config,
     item2sid,
     item_embedding,
-    prefix_lookup=None,
 ):
-    progress_bar = tqdm(
-        train_dataloader,
-        total=len(train_dataloader),
-        desc=f"epoch {epoch + 1}",
-    )
+    progress_bar = tqdm(range(len(train_dataloader)))
     model.train()
     all_ids = np.arange(item2sid.shape[0]) + 1
     unseen_ids = np.setdiff1d(all_ids, seen_ids)
@@ -347,20 +263,16 @@ def train_epoch(
     # `prefix_depth` sids (the prefix). sids beyond `prefix_depth` are masked
     # out from the autoregressive loss with -100.
     #
-    # Dense retrieval loss (prefix-bucket negatives): positives = the target
-    # item; negatives = every other item that shares the target's prefix (same
-    # bucket). Items outside the bucket are masked to -100, so the dense head
-    # only learns to disambiguate within a collision bucket -- which is exactly
-    # what evaluation asks it to do (rank items inside the generated prefix's
-    # bucket). This aligns the training and evaluation objectives.
-    #
-    # To keep this fast we do NOT project the full library every step. We gather
-    # only the items that belong to the buckets touched by this batch, project
-    # just those, then scatter the projected vectors back to the [B, n_items]
-    # logit matrix and CE over the (small) candidate positions.
+    # Dense retrieval loss (in-batch contrastive, "not 摸高" version): only the
+    # B target items in the current batch are projected. The positive for
+    # sample i is its own target item; the other B-1 targets in the batch act
+    # as negatives. This avoids projecting the full item library every step
+    # (the original liger cost) and removes the prefix-bucket lookup. Each
+    # train batch only contains seen items (unseen items only appear in
+    # val/test splits), so every target is a valid candidate.
     prefix_depth = method_config.get("prefix_depth", 0)
 
-    for batch in progress_bar:
+    for batch in train_dataloader:
         optimizer.zero_grad()
 
         if (
@@ -387,7 +299,6 @@ def train_epoch(
         loss += hard_loss * method_config["sid_loss_weight"]
 
         embedding_loss = 0
-        bucket_loss = 0
         if method_config["flag_use_output_embedding"]:
             predicted_embedding = (
                 model.predicted_embedding
@@ -406,76 +317,19 @@ def train_epoch(
                 == batch["labels_sids"][:, :n_cmp].numpy()
             ).all()
 
-            dense_loss_mode = method_config.get("dense_loss_mode", "full")
-            if dense_loss_mode == "in_batch":
-                # In-batch contrastive: project only the B target items in this
-                # batch; the positive for sample i is its own target item, the
-                # other B-1 batch targets act as negatives. Much cheaper than
-                # full-library softmax (no full-library projection per step),
-                # at the cost of fewer/weaker negatives. Used for the liger
-                # in-batch ablation.
-                target_emb = item_embedding[logits_label]  # [B, 768]
-                _, logits = get_target_embed(
-                    predicted_embedding, model, method_config, target_emb
-                )  # [B, B]
-                targets = torch.arange(
-                    logits.shape[0], device=logits.device
-                )  # diagonal = positive
-                embedding_loss = F.cross_entropy(logits, targets)
-            else:
-                # Full-library softmax (liger original, default): project every
-                # seen item, mask out unseen items, and CE over the whole
-                # library. Strong global retrieval signal.
-                _, logits = get_target_embed(
-                    predicted_embedding, model, method_config, item_embedding
-                )
-                logits[:, unseen_ids - 1] = -100
-                embedding_loss = F.cross_entropy(logits, logits_label)
-
-            # --- Auxiliary bucket contrastive loss (hybrid-only) ---
-            # Aligns the dense head with the evaluation candidate set: at eval
-            # time dense only ranks items inside the target's prefix bucket, so
-            # we add a bucket-only CE that teaches dense to disambiguate within
-            # the bucket. We gather the union of the batch's buckets and project
-            # only those items (n_cand << N), so this is cheap on top of the
-            # full-library projection above.
-            if (
-                method_config["evaluation_method"] == "hybrid"
-                and prefix_depth
-                and prefix_lookup is not None
-                and method_config.get("bucket_loss_weight", 0.0) > 0
-            ):
-                item_to_prefix_id = prefix_lookup["item_to_prefix_id"]  # [n_items]
-                prefix_buckets_padded = prefix_lookup[
-                    "prefix_buckets_padded"
-                ]  # [n_prefixes, K_max]
-
-                B = logits_label.shape[0]
-                pid = item_to_prefix_id[logits_label]  # [B]
-                buckets = prefix_buckets_padded[pid]  # [B, K_max]
-
-                # union of all items in this batch's buckets
-                cand_items = torch.unique(buckets.reshape(-1))  # [n_cand]
-                local_idx = torch.searchsorted(cand_items, buckets)  # [B, K_max]
-
-                # project only the touched items (cheap)
-                cand_emb = item_embedding[cand_items]  # [n_cand, 768]
-                _, cand_logits_per_item = get_target_embed(
-                    predicted_embedding, model, method_config, cand_emb
-                )  # [B, n_cand]
-
-                # per-row mask: sample i only sees its own bucket's items
-                row_mask = torch.zeros(
-                    B, cand_items.shape[0], dtype=torch.bool, device=device
-                )
-                b_idx = torch.arange(B, device=device)[:, None].expand_as(local_idx)
-                row_mask[b_idx, local_idx] = True
-                cand_logits = cand_logits_per_item.masked_fill(~row_mask, -100.0)
-
-                target_local = torch.searchsorted(cand_items, logits_label)  # [B]
-                bucket_loss = F.cross_entropy(cand_logits, target_local)
+            # In-batch contrastive: project only the B target items in this
+            # batch (not the full library). get_target_embed returns logits
+            # [B, B] where logits[i, j] = cos(query_i, target_j) / temp; the
+            # diagonal is the positive pair, off-diagonals are negatives.
+            target_emb = item_embedding[logits_label]  # [B, 768]
+            _, logits = get_target_embed(
+                predicted_embedding, model, method_config, target_emb
+            )  # [B, B]
+            targets = torch.arange(
+                logits.shape[0], device=logits.device
+            )  # diagonal = positive
+            embedding_loss = F.cross_entropy(logits, targets)
         loss += embedding_loss * method_config["embedding_loss_weight"]
-        loss += bucket_loss * method_config.get("bucket_loss_weight", 0.0)
 
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -496,7 +350,6 @@ def train_epoch(
     }
     logs["train/sid_loss"] = hard_loss
     logs["train/embedding_loss"] = embedding_loss
-    logs["train/bucket_loss"] = bucket_loss
 
     writer.log(logs)
 
@@ -565,23 +418,12 @@ def train_tiger(
         axis=0,
     )  # [n_items, n_code]
 
-    # Build the prefix -> item-set mapping used by the hybrid method.
-    # - prefix2items: used by evaluation (evaluate_prefix_then_dense) to look up
-    #   the candidate items per generated prefix.
-    # - prefix_lookup: padded bucket tensors used by training (train_epoch) to
-    #   restrict dense-retrieval negatives to the target's prefix bucket, which
-    #   aligns the training objective with the evaluation candidate set.
+    # Build the prefix -> item-set mapping used by the hybrid method (eval only;
+    # the training dense loss now uses in-batch contrastive and does not need
+    # the prefix buckets).
     prefix2items = None
-    prefix_lookup = None
     if method_config["evaluation_method"] == "hybrid":
         prefix2items = build_prefix2items(item2sid, method_config["prefix_depth"])
-        item_to_prefix_id, prefix_buckets_padded = build_prefix_lookup(
-            prefix2items, item2sid.shape[0]
-        )
-        prefix_lookup = {
-            "item_to_prefix_id": item_to_prefix_id.to(device),
-            "prefix_buckets_padded": prefix_buckets_padded.to(device),
-        }
         print(
             f"[hybrid] Built prefix2items mapping: {len(prefix2items)} unique "
             f"prefixes (prefix_depth={method_config['prefix_depth']}, "
@@ -783,7 +625,6 @@ def train_tiger(
             method_config,
             item2sid,
             item_embedding,
-            prefix_lookup=prefix_lookup,
         )
         global_step += len(train_dataloader)
 
