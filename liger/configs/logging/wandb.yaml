@@ -1,3 +1,5 @@
 writer: wandb
 mode: online  # option: disabled, online. Disable so don't log wandb.
-project: liger
+# wandb project name. Override via command line or config to group runs
+# (e.g. "hybird_gr", "liger", "gr_hybrid_ablation", ...).
+project: hybird_gr

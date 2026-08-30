@@ -13,6 +13,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 from utils import set_weight_decay
@@ -174,6 +175,26 @@ def train(config, device, item_embedding, id_split, id_save_location):
 
         writer = setup_logging(config)
         model_config = config["dataset"]["RQ-VAE"]
+
+        # Optionally apply StandardScaler to embeddings before RQ-VAE.
+        # StandardScaler zero-means and unit-variances each feature dim.
+        #   false (default) — skip; fused embeddings have their own scale
+        #                      structure that StandardScaler would distort.
+        #   true            — apply; useful for pure CF embeddings whose
+        #                      scale may be uneven across dims.
+        use_scaler = model_config.get("use_standard_scaler", False)
+        if use_scaler:
+            seen_emb = item_embedding[id_split["seen"] - 1].cpu().numpy()
+            scaler = StandardScaler()
+            scaler.fit(seen_emb)
+            item_embedding = torch.tensor(
+                scaler.transform(item_embedding.cpu().numpy()),
+                dtype=item_embedding.dtype,
+                device=device,
+            )
+            print("  StandardScaler applied to embeddings before RQ-VAE.")
+        else:
+            print("  StandardScaler skipped (using raw embedding scale).")
 
         input_size = model_config["input_dim"]
         hidden_sizes = model_config["hidden_dim"]

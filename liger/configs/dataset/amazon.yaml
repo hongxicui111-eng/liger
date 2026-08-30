@@ -10,6 +10,22 @@ features_needed: ['title', 'price', 'brand', 'categories']
 content_model: sentence-t5-xxl
 prompt_format: "amazon"
 
+# Optional: specify pre-quantized SID file and/or fused embedding file to
+# skip RQ-VAE / SASRec training and jump directly to model training.
+# sid_path: "/path/to/your_sid.pkl"
+# SASRec.fused_embedding_path: "/path/to/your_fused.pt"
+sid_path: null
+
+# Which embedding the T5 model uses for input, label, and dense retrieval.
+# Independent of SID quantization (which always uses the fused embedding
+# when SASRec is enabled, or pure semantic when disabled).
+#   "fused"    (default) — semantic + CF, consistent with SID quantization.
+#   "semantic"          — pure semantic only. SID still benefits from CF
+#                          fusion, but the model sees clean semantic signal.
+#                          Better when CF adds noise to dense retrieval
+#                          (e.g. cold-start items with random CF embeddings).
+model_embedding: "fused"
+
 RQ-VAE:
   optimizer: AdamW
   weight_decay: 0.1
@@ -28,12 +44,31 @@ RQ-VAE:
   code_book_size: 256
   max_seq_len: 256
   val_ratio: 0.05
+  # Whether to apply StandardScaler to embeddings before RQ-VAE quantization.
+  #   false (default) — skip. Fused embeddings (L2-normalized semantic + CF)
+  #                      have their own scale structure; StandardScaler would
+  #                      distort it. RQ-VAE's encoder LayerNorm adapts instead.
+  #   true            — apply. Zero-means and unit-variances each feature dim.
+  #                      Useful for pure CF embeddings with uneven per-dim scale.
+  use_standard_scaler: false
 
 # Bold fusion: train SASRec with frozen semantic emb + learned CF emb,
 # then use the fused (semantic+CF) embedding for RQ-VAE quantization.
 # hidden_units is auto-set to the semantic embedding dim (no projection).
 SASRec:
   enabled: true
+  # Fusion mode: how SASRec builds item representations.
+  #   "fused" (default) — semantic + CF (bold fusion). The frozen L2-normalized
+  #                        semantic embedding is added to the learned CF embedding.
+  #   "cf_only"          — pure CF, no semantic input. The model learns
+  #                        collaborative embeddings from scratch, like original
+  #                        SASRec. hidden_units defaults to the semantic dim
+  #                        for RQ-VAE compatibility but can be overridden below.
+  fusion_mode: "fused"
+  # CF embedding dimension. In fused mode this is auto-set to the semantic
+  # embedding dim (768). In cf_only mode, defaults to 768 for RQ-VAE
+  # compatibility but can be set to any value (e.g. 64 for a compact CF emb).
+  # hidden_units: 768
   num_heads: 2
   num_blocks: 2
   max_len: 50
@@ -50,6 +85,26 @@ SASRec:
   #   "loss"   — training loss only, no Recall/NDCG evaluation. Faster,
   #              suitable when you just need CF signal quickly.
   eval_metric: metric
+  # Similarity metric for SASRec training loss:
+  #   "dot"   (default) — raw dot-product, original behaviour. Norm carries
+  #                        signal; requires normalize_semantic=true to avoid
+  #                        gradient explosion with large-norm semantic embeddings.
+  #   "cosine"           — L2-normalize hidden & item_emb before dot-product.
+  #                        Scale-invariant; normalize_semantic can be false.
+  similarity_metric: "dot"
+  # Temperature for InfoNCE loss: divides similarity scores before softmax.
+  #   1.0 (default) — no scaling; recommended for dot product (scores are
+  #                   unbounded, softmax already sensitive to differences).
+  #   0.1           — recommended for cosine similarity. cosine scores ∈
+  #                   [-1,1] → [-10,10] after scaling, making softmax
+  #                   sensitive to small angular differences. Without this,
+  #                   batch softmax loss ≈ log(B) and barely decreases.
+  temperature: 1.0
+  # Whether to L2-normalize semantic embeddings before adding to CF.
+  #   true  (default) — needed for dot-product (norm ≈ 27.7 → 1.0)
+  #   false — skip normalization; use with cosine similarity or when
+  #            semantic embeddings are already at reasonable scale.
+  normalize_semantic: true
   # Optional: explicitly specify a fused embedding file to skip SASRec
   # training and load directly. e.g. "/path/to/xxx_fused.pt"
   # If set and the file exists, SASRec training is skipped entirely.

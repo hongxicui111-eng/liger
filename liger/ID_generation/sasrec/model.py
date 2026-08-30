@@ -39,6 +39,8 @@ class SASRec(nn.Module):
         max_len=50,
         dropout=0.2,
         semantic_embeddings=None,
+        similarity_metric="dot",
+        temperature=1.0,
     ):
         super().__init__()
         self.num_items = num_items
@@ -46,6 +48,12 @@ class SASRec(nn.Module):
         self.num_heads = num_heads
         self.num_blocks = num_blocks
         self.max_len = max_len
+        self.similarity_metric = similarity_metric
+        # Temperature for InfoNCE loss: divides similarity scores before
+        # softmax. cosine scores ∈ [-1, 1] → with τ=0.1, scores ∈ [-10, 10],
+        # making softmax sensitive to small angular differences. For dot
+        # product (unbounded scores), τ=1.0 preserves original behaviour.
+        self.temperature = temperature
 
         # CF embedding (learned) — 0 is padding, items are 1-indexed
         self.item_embeddings = nn.Embedding(num_items + 1, hidden_units, padding_idx=0)
@@ -158,9 +166,20 @@ class SASRec(nn.Module):
         hidden = self.log2feats(seq_ids)  # [B, seq_len, hidden_units]
         pos_emb = self._item_emb(pos_ids)    # [B, seq_len, hidden_units]
 
-        # Cross-score: scores[b, c, t] = hidden[b, t] · pos_emb[c, t]
+        # Cross-score: scores[b, c, t] = similarity(hidden[b, t], pos_emb[c, t])
         # b = query user, c = candidate item (from batch), t = position
-        scores = torch.einsum('btd,ctd->bct', hidden, pos_emb)  # [B, B, seq_len]
+        if self.similarity_metric == "cosine":
+            hidden_norm = F.normalize(hidden, dim=-1)
+            pos_emb_norm = F.normalize(pos_emb, dim=-1)
+            scores = torch.einsum('btd,ctd->bct', hidden_norm, pos_emb_norm)
+        else:  # dot (default, original behaviour)
+            scores = torch.einsum('btd,ctd->bct', hidden, pos_emb)  # [B, B, seq_len]
+
+        # Temperature scaling: amplify score differences before softmax.
+        # For cosine (scores ∈ [-1,1]), τ < 1 sharpens the distribution,
+        # letting the model distinguish small angular differences. For
+        # dot product (unbounded), τ=1.0 is a no-op.
+        scores = scores / self.temperature
 
         # Mask padding negatives: if pos_ids[c, t] == 0, candidate c is padding
         neg_mask = (pos_ids == 0)  # [B, seq_len]
@@ -206,6 +225,9 @@ class SASRec(nn.Module):
         item_emb = self._item_emb(item_ids)  # [B, num_candidates, hidden_units]
 
         # Compute scores
+        if self.similarity_metric == "cosine":
+            user_repr = F.normalize(user_repr, dim=-1)
+            item_emb = F.normalize(item_emb, dim=-1)
         scores = (user_repr.unsqueeze(1) * item_emb).sum(dim=-1)  # [B, num_candidates]
         return scores
 

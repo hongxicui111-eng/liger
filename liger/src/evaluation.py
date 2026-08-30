@@ -364,12 +364,24 @@ def get_target_embed(predicted_embedding, model, method_config, item_embedding):
         if method_config["embedding_head_dict"]["normalize_logits"]:
             temperature = method_config["embedding_head_dict"]["logits_temperature"]
 
-        predicted_embedding = F.normalize(predicted_embedding, dim=1)
-        _item_embedding = F.normalize(_item_embedding, dim=-1)
-        logits = (
-            predicted_embedding[:, None, :]
-            * _item_embedding.type(predicted_embedding.dtype)
-        ).sum(-1) / temperature
+        # Similarity metric: "cosine" (default) or "dot" (raw dot-product).
+        # "dot" is useful when the item embeddings (e.g. SASRec CF) were
+        # trained with dot-product and their norm carries signal that
+        # cosine normalization would discard.
+        sim_metric = method_config.get("similarity_metric", "cosine")
+
+        if sim_metric == "dot":
+            logits = (
+                predicted_embedding[:, None, :]
+                * _item_embedding.type(predicted_embedding.dtype)
+            ).sum(-1) / temperature
+        else:  # cosine (default)
+            predicted_embedding = F.normalize(predicted_embedding, dim=1)
+            _item_embedding = F.normalize(_item_embedding, dim=-1)
+            logits = (
+                predicted_embedding[:, None, :]
+                * _item_embedding.type(predicted_embedding.dtype)
+            ).sum(-1) / temperature
 
     return _item_embedding, logits
 

@@ -121,39 +121,10 @@ PREFIX_DEPTH=2
 #         dataset=amazon \
 #         dataset.name=$dataset_name \
 #         dataset.SASRec.enabled=True \
-#         dataset.SASRec.eval_metric=metric \
-#         dataset.sid_path="/share/cuihongxi/rerank/hybird_gr/liger/liger/ID_generation/ID/Beauty_sentence-t5-xxl_fused_42.pkl" \
-#         dataset.SASRec.fused_embedding_path="/share/cuihongxi/rerank/hybird_gr/liger/liger/ID_generation/sasrec/ckpt/Beauty_sentence-t5-xxl_fused_42.pt" \
-#         seed=42 \
-#         device_id=0 \
-#         method=hybrid \
-#         test_method=hybrid \
-#         method.prefix_depth=$PREFIX_DEPTH \
-#         method.embedding_loss_weight=1 \
-#         method.bucket_loss_weight=0.0 \
-#         method.similarity_metric=dot \
-#         experiment_id="ModelfuseDot_SASRecLoss_code${PREFIX_DEPTH}_embloss1_bucket0_ALL$dataset_name"
-# done
-
-
-
-
-#都跑一轮，目前最好的方案
-
-# for dataset_name in Toys_and_Games
-# do
-#     python run.py \
-#         dataset=amazon \
-#         dataset.name=$dataset_name \
-#         dataset.SASRec.enabled=True \
 #         dataset.SASRec.eval_metric="loss" \
-#         dataset.SASRec.normalize_semantic=True \
-#         dataset.SASRec.similarity_metric="dot" \
-#         dataset.SASRec.temperature=1.0 \
-#         dataset.SASRec.num_heads=8 \
-#         dataset.SASRec.epochs=200 \
-#         dataset.RQ-VAE.use_standard_scaler=True \
-#         dataset.model_embedding="semantic" \
+#         dataset.SASRec.similarity_metric="cosine" \
+#         dataset.SASRec.normalize_semantic=False \
+#         dataset.SASRec.temperature=0.07 \
 #         seed=42 \
 #         device_id=1 \
 #         method=hybrid \
@@ -161,24 +132,27 @@ PREFIX_DEPTH=2
 #         method.prefix_depth=$PREFIX_DEPTH \
 #         method.embedding_loss_weight=1.0 \
 #         method.bucket_loss_weight=0.0 \
-#         method.similarity_metric="cosine" \
-#         logging.project="HyGR_Best_otherDataSet" \
-#         experiment_id="SASRecLoss200Epoch_DotNorm_T1_SIDScaler_ModelSem_Pre${PREFIX_DEPTH}_embloss1_bucket0_ALL$dataset_name" \
+#         logging.project="sidcid_Merge_HyGR" \
+#         experiment_id="Modelfuse_SASRecLoss500Epoch_CosNoNorm_T007_Pre${PREFIX_DEPTH}_embloss1_bucket0_ALL$dataset_name" \
 #         force_rerun=True
 # done
 
-for dataset_name in Sports_and_Outdoors
+
+
+
+#目前最好的模型，加大SASRec训练轮次 
+for dataset_name in Beauty 
 do
     python run.py \
         dataset=amazon \
         dataset.name=$dataset_name \
         dataset.SASRec.enabled=True \
         dataset.SASRec.eval_metric="loss" \
-        dataset.SASRec.normalize_semantic=True \
         dataset.SASRec.similarity_metric="dot" \
+        dataset.SASRec.normalize_semantic=True \
         dataset.SASRec.temperature=1.0 \
         dataset.SASRec.num_heads=8 \
-        dataset.SASRec.epochs=200 \
+        dataset.SASRec.epochs=500 \
         dataset.RQ-VAE.use_standard_scaler=True \
         dataset.model_embedding="semantic" \
         seed=42 \
@@ -188,9 +162,8 @@ do
         method.prefix_depth=$PREFIX_DEPTH \
         method.embedding_loss_weight=1.0 \
         method.bucket_loss_weight=0.0 \
-        method.similarity_metric="cosine" \
-        logging.project="HyGR_Best_otherDataSet" \
-        experiment_id="SASRecLoss200Epoch_DotNorm_T1_SIDScaler_ModelSem_Pre${PREFIX_DEPTH}_embloss1_bucket0_ALL$dataset_name" \
+        method.similarity_metric="cosine"\
+        logging.project="sidcid_Merge_HyGR" \
+        experiment_id="SASRecLoss500Epoch_DotNorm_T1_SIDScaler_ModelSem_Pre${PREFIX_DEPTH}_embloss1_bucket0_ALL$dataset_name" \
         force_rerun=True
 done
-

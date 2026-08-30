@@ -41,7 +41,10 @@ class set_dir:
             # fused (semantic + CF) embedding instead of the raw semantic one.
             # Use a distinct SID filename to avoid reusing the old SID cache.
             sasrec_cfg = config["dataset"].get("SASRec", {})
-            fusion_tag = "_fused" if sasrec_cfg.get("enabled", False) else ""
+            fusion_tag = ""
+            if sasrec_cfg.get("enabled", False):
+                fm = sasrec_cfg.get("fusion_mode", "fused")
+                fusion_tag = "_fused" if fm == "fused" else "_cf"
             self.id_save_location = os.path.join(
                 self.rqvae_save_dir,
                 id_filename + f"{fusion_tag}_{config['seed']}.pkl",
@@ -51,7 +54,7 @@ class set_dir:
             self.sasrec_save_dir = "./ID_generation/sasrec/ckpt/"
             os.makedirs(self.sasrec_save_dir, exist_ok=True)
             self.sasrec_fused_path = os.path.join(
-                self.sasrec_save_dir, id_filename + f"_fused_{config['seed']}.pt"
+                self.sasrec_save_dir, id_filename + f"{fusion_tag}_{config['seed']}.pt"
             )
 
         self.embedding_save_name = f"_{config['dataset']['content_model']}"
@@ -77,10 +80,13 @@ class set_dir:
         if config.get("force_rerun", False):
             run_dir = config["output_path"]
             sasrec_cfg = config["dataset"].get("SASRec", {})
-            fusion_tag = "_fused" if sasrec_cfg.get("enabled", False) else ""
+            fusion_tag = ""
+            if sasrec_cfg.get("enabled", False):
+                fm = sasrec_cfg.get("fusion_mode", "fused")
+                fusion_tag = "_fused" if fm == "fused" else "_cf"
 
             self.sasrec_fused_path = os.path.join(
-                run_dir, f"sasrec_fused{fusion_tag}_{config['seed']}.pt"
+                run_dir, f"sasrec{fusion_tag}_{config['seed']}.pt"
             )
             self.id_save_location = os.path.join(
                 run_dir, f"sid{fusion_tag}_{config['seed']}.pkl"
@@ -104,7 +110,10 @@ def main(config: DictConfig) -> None:
 
     PATH_CONFIG = set_dir(config)
     config = PATH_CONFIG.set_config(config)
-    config["logging"]["project"] = "hybird_gr"
+    # Use the wandb project name from config (configs/logging/wandb.yaml),
+    # falling back to "hybird_gr" if unset. Override by setting
+    # `logging.project` in your run command or config.
+    config["logging"]["project"] = config["logging"].get("project", "hybird_gr")
     is_steam = config["dataset"]["type"] == "steam"
 
     try:
@@ -134,15 +143,22 @@ def main(config: DictConfig) -> None:
             config, data_file, id2meta_file, is_steam=is_steam
         )
 
+        # Allow explicitly specifying a pre-quantized SID file — skips
+        # RQ-VAE training entirely (train_sid returns early if file exists).
+        sid_path_override = config["dataset"].get("sid_path", None)
+        if sid_path_override:
+            PATH_CONFIG.id_save_location = sid_path_override
+            print(f"Using explicit SID file: {PATH_CONFIG.id_save_location}")
+
         # load item embedding
         item_embedding = process_embeddings(
             config, device, id2meta_file, PATH_CONFIG.embedding_save_path
         )
 
-        # --- Bold fusion: train SASRec to fuse semantic + CF embeddings ---
-        # The fused embedding replaces item_embedding *only* for RQ-VAE
-        # quantization (train_sid). train_tiger still uses the original
-        # semantic embedding — "之后的都先不动".
+        # The fused embedding (semantic + CF) is used for both RQ-VAE
+        # quantization (train_sid) and model training / dense retrieval
+        # (train_tiger). This keeps SID generation and dense retrieval
+        # consistent — both leverage the collaborative signal.
         sasrec_cfg = config["dataset"].get("SASRec", {})
         if sasrec_cfg.get("enabled", False):
             num_items = item_embedding.shape[0]
@@ -160,22 +176,41 @@ def main(config: DictConfig) -> None:
                 # test (seq[-1]) items to prevent data leakage.
                 sasrec_train_seqs = [seq[:-2] for seq in user_sequence if len(seq) > 2]
 
-                # L2-normalize semantic embeddings before fusion.
-                # After StandardScaler, raw semantic norm ≈ sqrt(768) ≈ 27.7,
-                # which makes BPR dot products explode (~768) → sigmoid
-                # saturates → CF gradients explode → loss diverges.
-                # Normalizing to unit norm keeps dot-product scale ~O(1).
-                sem_normed = item_embedding / item_embedding.norm(
-                    dim=-1, keepdim=True).clamp(min=1e-8)
-                # Build semantic embeddings with padding row at index 0
-                sem_with_pad = torch.cat(
-                    [torch.zeros(1, item_embedding.shape[1], device=device),
-                     sem_normed],
-                    dim=0,
-                )  # [num_items+1, dim]
+                # Fusion mode: how SASRec combines semantic and CF signals.
+                #   "fused" (default) — semantic + CF (bold fusion)
+                #   "cf_only"         — pure CF, no semantic input; the model
+                #                        learns collaborative embeddings from
+                #                        scratch, like original SASRec.
+                fusion_mode = sasrec_cfg.get("fusion_mode", "fused")
 
-                print(f"\nTraining SASRec for bold fusion (semantic + CF)...")
+                # L2-normalize semantic embeddings before fusion (optional).
+                # When using dot-product similarity in SASRec, raw semantic
+                # norm ≈ 27.7 makes dot products explode → loss diverges.
+                # Normalizing to unit norm keeps dot-product scale ~O(1).
+                # When using cosine similarity, normalization happens inside
+                # the model, so pre-normalization is optional (but harmless).
+                normalize_semantic = sasrec_cfg.get("normalize_semantic", True)
+
+                if fusion_mode == "fused":
+                    if normalize_semantic:
+                        sem_normed = item_embedding / item_embedding.norm(
+                            dim=-1, keepdim=True).clamp(min=1e-8)
+                    else:
+                        sem_normed = item_embedding
+                    # Build semantic embeddings with padding row at index 0
+                    sem_with_pad = torch.cat(
+                        [torch.zeros(1, item_embedding.shape[1], device=device),
+                         sem_normed],
+                        dim=0,
+                    )  # [num_items+1, dim]
+                else:
+                    # cf_only: no semantic embeddings
+                    sem_with_pad = None
+
+                print(f"\nTraining SASRec [{fusion_mode}] ...")
                 print(f"  num_items={num_items}, hidden_units={item_embedding.shape[1]}")
+                if sem_with_pad is not None:
+                    print(f"  normalize_semantic={normalize_semantic}")
 
                 # Set up a wandb run for SASRec training
                 from utils import setup_logging
@@ -190,6 +225,12 @@ def main(config: DictConfig) -> None:
                     num_blocks=sasrec_cfg.get("num_blocks", 2),
                     max_len=sasrec_cfg.get("max_len", 50),
                     dropout=sasrec_cfg.get("dropout", 0.2),
+                    # In fused mode, hidden_units is auto-overridden inside
+                    # train_sasrec to match semantic_embeddings.shape[1].
+                    # In cf_only mode, default to the semantic dim so the
+                    # output CF embeddings are compatible with RQ-VAE's
+                    # input_dim. Override via SASRec.hidden_units in config.
+                    hidden_units=sasrec_cfg.get("hidden_units", item_embedding.shape[1]),
                     epochs=sasrec_cfg.get("epochs", 200),
                     lr=sasrec_cfg.get("lr", 0.001),
                     batch_size=sasrec_cfg.get("batch_size", 128),
@@ -198,6 +239,8 @@ def main(config: DictConfig) -> None:
                     eval_metric=sasrec_cfg.get("eval_metric", "metric"),
                     seed=config["seed"],
                     semantic_embeddings=sem_with_pad,
+                    similarity_metric=sasrec_cfg.get("similarity_metric", "dot"),
+                    temperature=sasrec_cfg.get("temperature", 1.0),
                     writer=sasrec_writer,
                     eval_sequences=user_sequence,
                 )
@@ -217,13 +260,31 @@ def main(config: DictConfig) -> None:
             config, device, fused_embedding, id_split, PATH_CONFIG.id_save_location
         )
 
+        # Decide which embedding the T5 model uses for input, label, and dense
+        # retrieval. This is independent of what RQ-VAE used for SID
+        # quantization (always fused_embedding above), allowing the
+        # combination "SID from fused, model from pure semantic".
+        #   "fused"    (default) — use fused embedding (semantic + CF),
+        #                           consistent with SID quantization.
+        #   "semantic"          — use pure semantic embedding; model sees
+        #                           clean semantic signal while SID still
+        #                           benefits from CF fusion. May perform
+        #                           better when CF adds noise to dense retrieval.
+        model_emb_source = config["dataset"].get("model_embedding", "fused")
+        if model_emb_source == "semantic":
+            model_embedding = item_embedding
+            print(f"Model (train_tiger) uses PURE SEMANTIC embedding: {model_embedding.shape}")
+        else:
+            model_embedding = fused_embedding
+            print(f"Model (train_tiger) uses FUSED embedding: {model_embedding.shape}")
+
         train_tiger(
             config,
             train_config,
             method_config,
             id_split,
             user_sequence,
-            item_embedding,
+            model_embedding,
             PATH_CONFIG.id_save_location,
             device=device,
         )

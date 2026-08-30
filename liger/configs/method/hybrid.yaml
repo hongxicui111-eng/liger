@@ -44,6 +44,15 @@ dense_loss_mode: "full"
 # Check `train/bucket_loss` vs `train/embedding_loss` on wandb to tune.
 bucket_loss_weight: 0.0
 
+# Similarity metric for dense retrieval (training + evaluation):
+#   "cosine" (default) — L2-normalize both predicted and item embeddings,
+#                         then dot-product ÷ temperature. Standard contrastive.
+#   "dot"              — raw dot-product ÷ temperature, no normalization.
+#                         Preserves embedding norm as signal; useful when item
+#                         embeddings come from dot-product-trained models (e.g.
+#                         SASRec CF embeddings).
+similarity_metric: "cosine"
+
 embedding_head_dict:
   normalize_logits: True  # flag_use_output_embedding: True
   logits_temperature: 0.07  # flag_use_output_embedding: True

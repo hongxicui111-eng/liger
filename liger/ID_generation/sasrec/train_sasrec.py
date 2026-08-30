@@ -207,6 +207,8 @@ def train_sasrec(
     eval_metric="metric",
     seed=42,
     semantic_embeddings=None,
+    similarity_metric="dot",
+    temperature=1.0,
     writer=None,
     eval_sequences=None,
 ):
@@ -283,6 +285,8 @@ def train_sasrec(
         max_len=max_len,
         dropout=dropout,
         semantic_embeddings=semantic_embeddings,
+        similarity_metric=similarity_metric,
+        temperature=temperature,
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -343,22 +347,25 @@ def train_sasrec(
                               pat=f"{patience_counter}/{patience}")
 
         if epoch % eval_steps == 0 or epoch == 1:
+            # Always compute Recall@10/NDCG@10 for wandb logging, regardless
+            # of the early-stopping metric. In "loss" mode, early stopping
+            # uses training loss, but we still log Recall/NDCG curves so
+            # users can monitor collaborative quality over time.
+            eval_seqs = eval_sequences if eval_sequences is not None else user_sequences
+            recall, ndcg = evaluate_recall_ndcg(
+                model, eval_seqs, num_items, device, max_len, k=10
+            )
+
             if eval_metric == "loss":
                 # --- Loss mode: use training loss for early stopping ---
-                # Lower is better
                 metric = -avg_loss  # negate so "higher is better" logic holds
-                recall, ndcg = 0.0, 0.0
 
                 tqdm.write(f"  [Epoch {epoch:4d}/{epochs}] loss={avg_loss:.6f}"
+                           f"  Recall@10={recall:.4f}  NDCG@10={ndcg:.4f}"
                            f"  best_loss={best_loss:.6f}"
                            f"  pat={patience_counter}/{patience}")
             else:
                 # --- Metric mode: Recall@10/NDCG@10 composite (default) ---
-                eval_seqs = eval_sequences if eval_sequences is not None else user_sequences
-                recall, ndcg = evaluate_recall_ndcg(
-                    model, eval_seqs, num_items, device, max_len, k=10
-                )
-                # Composite metric for model selection & early stopping
                 metric = ndcg * 0.6 + recall * 0.4
 
                 tqdm.write(f"  [Epoch {epoch:4d}/{epochs}] loss={avg_loss:.6f}"
@@ -390,13 +397,10 @@ def train_sasrec(
                     "sasrec/train_loss": avg_loss,
                     "sasrec/best_metric": best_metric,
                     "sasrec/patience_counter": patience_counter,
+                    "sasrec/recall@10": recall,
+                    "sasrec/ndcg@10": ndcg,
+                    "sasrec/composite_metric": ndcg * 0.6 + recall * 0.4,
                 }
-                if eval_metric != "loss":
-                    log_dict.update({
-                        "sasrec/recall@10": recall,
-                        "sasrec/ndcg@10": ndcg,
-                        "sasrec/composite_metric": metric,
-                    })
                 writer.log(log_dict)
 
     # Restore best model
