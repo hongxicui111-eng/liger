@@ -14,7 +14,9 @@ prompt_format: "amazon"
 # skip RQ-VAE / SASRec training and jump directly to model training.
 # sid_path: "/path/to/your_sid.pkl"
 # SASRec.fused_embedding_path: "/path/to/your_fused.pt"
+# semantic_embedding_path: "/path/to/your_semantic_embeddings.pt"
 sid_path: null
+semantic_embedding_path: null
 
 # Which embedding the T5 model uses for input, label, and dense retrieval.
 # Independent of SID quantization (which always uses the fused embedding
@@ -68,7 +70,7 @@ SASRec:
   # CF embedding dimension. In fused mode this is auto-set to the semantic
   # embedding dim (768). In cf_only mode, defaults to 768 for RQ-VAE
   # compatibility but can be set to any value (e.g. 64 for a compact CF emb).
-  # hidden_units: 768
+  hidden_units: 768
   num_heads: 2
   num_blocks: 2
   max_len: 50
@@ -101,10 +103,26 @@ SASRec:
   #                   batch softmax loss ≈ log(B) and barely decreases.
   temperature: 1.0
   # Whether to L2-normalize semantic embeddings before adding to CF.
+  # Only used when fusion_method="normalize".
   #   true  (default) — needed for dot-product (norm ≈ 27.7 → 1.0)
   #   false — skip normalization; use with cosine similarity or when
   #            semantic embeddings are already at reasonable scale.
   normalize_semantic: true
+  # How the semantic embedding is transformed before fusion with CF
+  # (only relevant when fusion_mode="fused"):
+  #   "normalize" (default) — L2-normalize (frozen) semantic, then add CF.
+  #                          Requires normalize_semantic for scale control.
+  #   "mlp"               — Pass semantic through a learnable Linear layer,
+  #                          then add CF. No pre-normalization; the projection
+  #                          learns the optimal scale/rotation of the semantic
+  #                          space. hidden_units can differ from semantic_dim.
+  fusion_method: "normalize"
+  # Whether to halt the entire pipeline after SASRec training completes.
+  # Useful for inspecting SASRec training quality (Recall/NDCG, loss) without
+  # running the expensive RQ-VAE + TIGER stages.
+  #   false (default) — continue to RQ-VAE and TIGER training as normal.
+  #   true            — stop after SASRec, print a summary, and exit.
+  stop_after_sasrec: false
   # Optional: explicitly specify a fused embedding file to skip SASRec
   # training and load directly. e.g. "/path/to/xxx_fused.pt"
   # If set and the file exists, SASRec training is skipped entirely.

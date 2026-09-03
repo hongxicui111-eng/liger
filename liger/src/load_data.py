@@ -123,12 +123,14 @@ def build_prefix_lookup(prefix2items, n_items):
     per-batch bucket lookup (used by the hybrid dense-retrieval loss to restrict
     negatives to the target's prefix bucket).
 
-    :return: (item_to_prefix_id, prefix_buckets_padded)
+    :return: (item_to_prefix_id, prefix_buckets_padded, bucket_sizes)
         - item_to_prefix_id: [n_items] int64, maps each 0-based item index to its
           prefix id (0..n_prefixes-1).
         - prefix_buckets_padded: [n_prefixes, K_max] int64, each row is the
           0-based item indices of that prefix bucket, padded with the bucket's
           own first item (so duplicate writes during scatter are harmless).
+        - bucket_sizes: [n_prefixes] int64, actual number of items in each bucket
+          (used to mask padding positions in the bucket CE loss).
     """
     prefix_list = list(prefix2items.keys())
     n_prefixes = len(prefix_list)
@@ -145,15 +147,19 @@ def build_prefix_lookup(prefix2items, n_items):
             k_max = len(items)
 
     prefix_buckets_padded = np.zeros((n_prefixes, k_max), dtype=np.int64)
+    bucket_sizes = np.zeros(n_prefixes, dtype=np.int64)
     for i, b in enumerate(buckets):
         if len(b) > 0:
             prefix_buckets_padded[i, : len(b)] = b
             # pad the tail with the bucket's first item: a duplicate scatter
             # write to an already-True position is harmless.
             prefix_buckets_padded[i, len(b) :] = b[0]
+            bucket_sizes[i] = len(b)
 
-    return torch.from_numpy(item_to_prefix_id), torch.from_numpy(
-        prefix_buckets_padded
+    return (
+        torch.from_numpy(item_to_prefix_id),
+        torch.from_numpy(prefix_buckets_padded),
+        torch.from_numpy(bucket_sizes),
     )
 
 
@@ -166,6 +172,7 @@ def generate_input_sequence(
     codebook_size,
     item_embedding,
     id_only,
+    input_sid_depth=0,
 ):
     if user_id is not None:  # indicating that we are using user_id
         input_sids = [user_id]
@@ -190,9 +197,12 @@ def generate_input_sequence(
             label_embeddings = this_item_embedding  # [1, 768]
         else:
             if not id_only:
-                input_semantic_ids = expand_id(
-                    item_2_semantic_id[user_sequence[i]], codebook_size
-                )
+                sid_tuple = item_2_semantic_id[user_sequence[i]]
+                # Truncate to first input_sid_depth SIDs when enabled
+                # (0 = use all, backward compatible)
+                if input_sid_depth > 0:
+                    sid_tuple = sid_tuple[:input_sid_depth]
+                input_semantic_ids = expand_id(sid_tuple, codebook_size)
                 input_sids.extend(input_semantic_ids)
             input_ids.append(user_sequence[i])
             attention_mask_sids.extend([1] * len(input_semantic_ids))
@@ -264,6 +274,9 @@ def load_data_helper(
 
     len_user_sequence = len(user_sequence)
 
+    # Read input_sid_depth: 0 = use all SIDs per input item (backward compat)
+    input_sid_depth = method_config.get("input_sid_depth", 0)
+
     for i in trange(len_user_sequence):
         if not id_only and method_config["include_user_id"]:
             # use Hashing Trick to map the user to 2000 user tokens
@@ -302,6 +315,7 @@ def load_data_helper(
                 codebook_size,
                 item_embedding,
                 id_only,
+                input_sid_depth=input_sid_depth,
             )
             if not id_only:
                 total_user_dict[this_key]["input_sids"].append(input_sids)

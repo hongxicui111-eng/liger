@@ -13,3 +13,6 @@ test_method: tiger
 # Weights are saved under this run's output_path (not the shared cache),
 # so old caches are never hit.
 force_rerun: False
+
+
+checkpoint_path: null

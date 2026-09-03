@@ -41,6 +41,7 @@ class SASRec(nn.Module):
         semantic_embeddings=None,
         similarity_metric="dot",
         temperature=1.0,
+        fusion_method="normalize",
     ):
         super().__init__()
         self.num_items = num_items
@@ -54,17 +55,35 @@ class SASRec(nn.Module):
         # making softmax sensitive to small angular differences. For dot
         # product (unbounded scores), τ=1.0 preserves original behaviour.
         self.temperature = temperature
+        # How semantic embeddings are fused with CF:
+        #   "normalize" — L2-normalized (frozen) + CF (current behaviour)
+        #   "mlp"       — Linear(semantic) + CF; the projection layer is
+        #                 learnable and can adapt the semantic space to CF.
+        self.fusion_method = fusion_method
 
         # CF embedding (learned) — 0 is padding, items are 1-indexed
         self.item_embeddings = nn.Embedding(num_items + 1, hidden_units, padding_idx=0)
 
-        # Frozen semantic embeddings (bold fusion: item_repr = semantic + CF, no projection)
+        # Frozen semantic embeddings + optional learnable projection
         if semantic_embeddings is not None:
+            semantic_dim = semantic_embeddings.shape[1]
             assert semantic_embeddings.shape == (
                 num_items + 1,
-                hidden_units,
-            ), f"semantic_embeddings must be [num_items+1, hidden_units], got {semantic_embeddings.shape}"
+                semantic_dim,
+            ), f"semantic_embeddings must be [num_items+1, semantic_dim], got {semantic_embeddings.shape}"
             self.register_buffer("semantic_embeddings", semantic_embeddings)
+
+            if fusion_method == "mlp":
+                # Learnable linear projection: semantic_dim -> hidden_units
+                # This allows the model to learn an optimal scaling/rotation
+                # of the semantic space before fusing with CF.
+                self.semantic_proj = nn.Linear(semantic_dim, hidden_units)
+            else:
+                # normalize mode: semantic_dim must equal hidden_units
+                assert semantic_dim == hidden_units, (
+                    f"fusion_method='normalize' requires semantic_dim==hidden_units, "
+                    f"got semantic_dim={semantic_dim}, hidden_units={hidden_units}"
+                )
         else:
             self.semantic_embeddings = None
         # Positional embedding
@@ -86,10 +105,13 @@ class SASRec(nn.Module):
         self.apply(self._init_weights)
 
     def _item_emb(self, ids):
-        """Fused item embedding: semantic (frozen) + CF (learned)."""
+        """Fused item embedding: semantic (frozen, optionally projected) + CF (learned)."""
         emb = self.item_embeddings(ids)
         if self.semantic_embeddings is not None:
-            emb = emb + self.semantic_embeddings[ids]
+            sem = self.semantic_embeddings[ids]
+            if self.fusion_method == "mlp":
+                sem = self.semantic_proj(sem)
+            emb = emb + sem
         return emb
 
     def _init_weights(self, module):

@@ -211,6 +211,7 @@ def train_sasrec(
     temperature=1.0,
     writer=None,
     eval_sequences=None,
+    fusion_method="normalize",
 ):
     """Train SASRec model on user-item interaction sequences.
 
@@ -269,10 +270,14 @@ def train_sasrec(
         dataset, batch_size=batch_size, shuffle=True, num_workers=0, drop_last=False
     )
 
-    # Create model — if semantic_embeddings is provided, hidden_units must match
+    # Create model — if semantic_embeddings is provided, hidden_units is
+    # auto-set to the semantic dim for "normalize" mode (they must match).
+    # For "mlp" mode, hidden_units can differ — the Linear layer projects
+    # from semantic_dim to hidden_units.
     if semantic_embeddings is not None:
         semantic_embeddings = semantic_embeddings.to(device)
-        hidden_units = semantic_embeddings.shape[1]
+        if fusion_method != "mlp":
+            hidden_units = semantic_embeddings.shape[1]
         # Sanity: padding row (index 0) should be zeros
         assert semantic_embeddings[0].abs().max() < 1e-6, \
             "semantic_embeddings[0] (padding) should be all zeros"
@@ -287,15 +292,17 @@ def train_sasrec(
         semantic_embeddings=semantic_embeddings,
         similarity_metric=similarity_metric,
         temperature=temperature,
+        fusion_method=fusion_method,
     ).to(device)
 
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
     # Training loop
     print(f"\n{'='*60}")
-    fusion_tag = "fused (semantic + CF)" if semantic_embeddings is not None else "CF-only"
+    fusion_tag = f"fused ({fusion_method})" if semantic_embeddings is not None else "CF-only"
     print(f"Training SASRec for item embeddings [{fusion_tag}]")
     print(f"  Items: {num_items}, Hidden dim: {hidden_units}")
+    print(f"  Fusion method: {fusion_method}")
     print(f"  Heads: {num_heads}, Blocks: {num_blocks}, Max len: {max_len}")
     print(f"  Epochs: {epochs}, Batch size: {batch_size}, LR: {lr}")
     print(f"  Eval every {eval_steps} epochs | Early-stop patience: {patience} checks")

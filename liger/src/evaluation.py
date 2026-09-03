@@ -15,6 +15,12 @@ from transformers import LogitsProcessor, LogitsProcessorList
 
 
 def model_forward(model, batch, device, n_codebook, method_config, skip_forward=False):
+    # Effective SID depth for encoder input items. When input_sid_depth > 0,
+    # each input item is represented by only the first N SIDs (shorter encoder
+    # sequence). 0 = use all n_codebook SIDs (backward compatible).
+    input_sid_depth = method_config.get("input_sid_depth", 0)
+    enc_sid_depth = input_sid_depth if input_sid_depth > 0 else n_codebook
+
     if method_config["use_id"] == "sid":
         input_sids = batch["input_sids"].to(device)
         attention_mask_sids = batch["attention_mask_sids"].to(device)
@@ -34,7 +40,7 @@ def model_forward(model, batch, device, n_codebook, method_config, skip_forward=
                 )  # this is the original embedding
                 input_text_embeddings_repeat = (
                     input_text_embeddings[:, :, None, :]
-                    .repeat(1, 1, n_codebook, 1)
+                    .repeat(1, 1, enc_sid_depth, 1)
                     .reshape(-1, input_text_embeddings_shape[-1])
                 )
                 proj_embd = model.emb_proj(input_text_embeddings_repeat)
@@ -43,19 +49,19 @@ def model_forward(model, batch, device, n_codebook, method_config, skip_forward=
                 )
                 # add positional embedding
                 pos_id = torch.arange(max_length, dtype=torch.long, device=device)
-                pos_id = pos_id[:, None].repeat(1, n_codebook).reshape(-1)
+                pos_id = pos_id[:, None].repeat(1, enc_sid_depth).reshape(-1)
                 pos_embd = model.pos_embedding(pos_id)  # [n_seq, n_embd]
                 proj_embd += pos_embd[None, :]
                 append_embedding = torch.zeros_like(inputs_embeds)
                 append_embedding[
-                    :, item_idx_start : item_idx_start + n_codebook * max_length
+                    :, item_idx_start : item_idx_start + enc_sid_depth * max_length
                 ] = proj_embd
                 # add the text embedding to the inputs embeds
                 inputs_embeds += append_embedding
                 # add the semantic positional embedding
                 seq_len = inputs_embeds.shape[1]
-                pattern = torch.arange(n_codebook)
-                semantic_pos = pattern.repeat(seq_len // n_codebook + 1)[:seq_len]
+                pattern = torch.arange(enc_sid_depth)
+                semantic_pos = pattern.repeat(seq_len // enc_sid_depth + 1)[:seq_len]
                 pos_embedding = model.semantic_pos(
                     semantic_pos.to(device)
                 )  # [n_seq, n_embd]
@@ -204,7 +210,7 @@ def calculate_metrics(outputs, labels, KEYS, codebook_level=4, lift_constraint=F
 
     for i in range(batch_size):
         for key in KEYS:
-            ndcg_at_i[key].append(ndcg_at_k_torch(matches[i], key))
+            ndcg_at_i[key].append(ndcg_at_k_torch(matches[i], key).item())
 
     metrics = (
         recall_at_i,
@@ -233,7 +239,7 @@ def calculate_metrics_id(outputs, labels, KEYS):
 
     for i in range(batch_size):
         for key in KEYS:
-            ndcg_at_i[key].append(ndcg_at_k_torch(matches[i], key))
+            ndcg_at_i[key].append(ndcg_at_k_torch(matches[i], key).item())
 
     # Calculate mean metrics
     metrics = (
@@ -532,7 +538,17 @@ def generate_then_dense(
         10,
     ],
     RETRIEVE_KEY=[20, 40, 60, 80, 100],
+    include_cold=True,
 ):
+    """Generate-then-dense unified evaluation.
+
+    When ``include_cold=True`` (default, standard behaviour), the cold-start
+    SIDs are appended to the generative candidates before dense re-ranking —
+    this is the original Liger behaviour.  When ``include_cold=False``, the
+    candidate pool consists of *only* the generative (beam-search) SIDs,
+    giving a **NoCold** variant that isolates the generative retrieval quality
+    without the cold-start safety net.
+    """
 
     model.eval()
     recall_dict_total, ndcg_dict_total = dict({}), dict({})
@@ -546,7 +562,11 @@ def generate_then_dense(
     num_candidates = max(KEYS)
 
     idx_start = 0
-    for batch in tqdm(dataloader, desc="Generating and Dense Retrieval"):
+    for batch in tqdm(
+        dataloader,
+        desc="Generating and Dense Retrieval"
+        + ("" if include_cold else " (NoCold)"),
+    ):
         labels = batch["labels_sids"].to(device)
         batch_size, n_codebook = (
             labels.shape[0],
@@ -558,7 +578,10 @@ def generate_then_dense(
             idx_start : idx_start + batch_size,
         ]  # [batch_size, num_candidate, n_code]
         idx_start += batch_size
-        cold_cand = torch.stack([unseen_semantic_ids] * this_batch_cand.shape[0], dim=0)
+        if include_cold:
+            cold_cand = torch.stack(
+                [unseen_semantic_ids] * this_batch_cand.shape[0], dim=0
+            )
 
         for _retrieve_key in RETRIEVE_KEY:
             if _retrieve_key not in recall_dict_total.keys():
@@ -566,7 +589,8 @@ def generate_then_dense(
                 ndcg_dict_total[_retrieve_key] = dict({})
 
             _this_batch_cand = this_batch_cand[:, :_retrieve_key]
-            _this_batch_cand = torch.cat([_this_batch_cand, cold_cand], dim=1)
+            if include_cold:
+                _this_batch_cand = torch.cat([_this_batch_cand, cold_cand], dim=1)
             matches = torch.all(
                 _this_batch_cand[:, :, None] == item2sid_tensor[None, None, :, :],
                 dim=-1,
@@ -621,7 +645,8 @@ def evaluate_prefix_then_dense(
     method_config,
     prefix2items,
     KEYS=[10],
-    num_candidates=100,
+    num_candidates_list=None,
+    add_cold_items=None,
 ):
     """
     Hybrid evaluation: generate a prefix of length ``prefix_depth`` with the
@@ -629,28 +654,56 @@ def evaluate_prefix_then_dense(
     that share that prefix (looked up from ``prefix2items``).
 
     The candidate set for a sample is the *union* of the item-sets of all the
-    generated (beam) prefixes (``num_candidates`` beams). The dense retriever
-    ranks this candidate set using the encoder's predicted embedding, and the
-    top-K items are compared to the ground-truth target item (item-level
-    Recall@K / NDCG@K).
+    generated (beam) prefixes. The dense retriever ranks this candidate set
+    using the encoder's predicted embedding, and the top-K items are compared
+    to the ground-truth target item (item-level Recall@K / NDCG@K).
 
-    Using ``num_candidates`` (> max(KEYS)) gives the dense retriever a real
-    ranking task instead of trivially taking all generated candidates.
+    ``num_candidates_list`` controls how many beam prefixes are used per
+    sample.  When a list is given (e.g. ``[20, 40, 60, 80, 100]``), the
+    function evaluates with each candidate count and returns nested dicts
+    ``recall_dict[n][key]`` — mirroring the ``Gen{n}_Recall@{key}`` logging
+    of Liger's ``generate_then_dense``.
+
+    When ``add_cold_items`` is provided (a 1-D LongTensor of 0-based item
+    indices for cold-start / unseen items), the function *also* computes an
+    **AddCold** variant for each candidate count: the candidate set becomes
+    ``prefix_items ∪ add_cold_items`` (deduplicated), and metrics are
+    collected into ``recall_dict_cold`` / ``ndcg_dict_cold``.
 
     :param item2sid: [n_items, n_codebook] expanded semantic ids, ``item2sid[i]``
                      are the sids of item ``i+1``.
     :param prefix2items: dict ``tuple(prefix)`` -> list of 0-based item indices.
     :param item_embedding: [n_items, n_embd] raw sentence embeddings (on device).
-    :param num_candidates: number of beam prefixes to generate per sample.
+    :param num_candidates_list: list of beam-prefix counts to evaluate with.
+           Defaults to ``[100]`` for backward compatibility.
+    :param add_cold_items: optional 1-D LongTensor of 0-based cold-start item
+           indices. When provided, also computes AddCold metrics.
+    :return: ``(recall_dict, ndcg_dict, recall_dict_cold, ndcg_dict_cold)``.
+             The cold dicts are empty when ``add_cold_items`` is None.
     """
+    # Normalise to a list for uniform handling
+    if num_candidates_list is None:
+        num_candidates_list = [100]
+    if isinstance(num_candidates_list, int):
+        num_candidates_list = [num_candidates_list]
+
     model.eval()
+    # Nested dicts: recall_dict[n_candidates][key] -> list[float]
     recall_dict, ndcg_dict = dict({}), dict({})
-    for key in KEYS:
-        recall_dict[key] = []
-        ndcg_dict[key] = []
+    for n in num_candidates_list:
+        recall_dict[n] = {key: [] for key in KEYS}
+        ndcg_dict[n] = {key: [] for key in KEYS}
+
+    # AddCold variant dicts (empty when add_cold_items is not provided)
+    recall_dict_cold, ndcg_dict_cold = dict({}), dict({})
+    if add_cold_items is not None:
+        add_cold_items = add_cold_items.to(device)
+        for n in num_candidates_list:
+            recall_dict_cold[n] = {key: [] for key in KEYS}
+            ndcg_dict_cold[n] = {key: [] for key in KEYS}
 
     if len(dataloader) == 0:
-        return recall_dict, ndcg_dict
+        return recall_dict, ndcg_dict, recall_dict_cold, ndcg_dict_cold
 
     prefix_depth = method_config["prefix_depth"]
     n_codebook = item2sid.shape[1]
@@ -658,8 +711,9 @@ def evaluate_prefix_then_dense(
         f"prefix_depth ({prefix_depth}) must be <= n_codebook ({n_codebook})"
     )
 
-    # generate `num_candidates` prefixes per sample; dense-rank their union.
-    num_return_sequences = max(num_candidates, max(KEYS))
+    # generate enough beams for the largest candidate count
+    max_candidates = max(num_candidates_list)
+    num_return_sequences = max(max_candidates, max(KEYS))
     num_beams = num_return_sequences
 
     # pre-convert the prefix -> item-index lists to device tensors for fast lookup
@@ -720,35 +774,202 @@ def evaluate_prefix_then_dense(
             target_item = labels_ids[b, 0].item() - 1  # 0-based target item index
             pred_emb = predicted_embedding[b]  # [n_embd]
 
-            # collect candidate items (union over all generated prefixes)
-            cand_item_tensors = []
+            # Pre-resolve prefix -> item tensor for every generated prefix
+            # so each candidate-count slice can reuse the same lookups.
+            prefix_items = []  # list of tensor or None
             for r in range(num_return_sequences):
                 prefix = tuple(int(x) for x in gen_prefixes[b, r].tolist())
-                items_t = prefix2items_tensor.get(prefix)
-                if items_t is not None:
-                    cand_item_tensors.append(items_t)
-            if len(cand_item_tensors) == 0:
-                # the model generated an invalid / unseen prefix -> no candidates
-                for key in KEYS:
-                    recall_dict[key].append(0.0)
-                    ndcg_dict[key].append(0.0)
-                continue
-            cand_items = torch.unique(torch.cat(cand_item_tensors))  # [n_cand]
+                prefix_items.append(prefix2items_tensor.get(prefix))
 
-            # dense retrieval: rank the candidate items by similarity to pred_emb
-            cand_emb = item_embedding[cand_items]  # [n_cand, n_embd]
-            _, logits = get_target_embed(
-                pred_emb[None], model, method_config, cand_emb
-            )  # [1, n_cand]
-            logits = logits[0]  # [n_cand]
+            for n in num_candidates_list:
+                # collect candidate items from the first n prefixes
+                cand_item_tensors = [
+                    prefix_items[r] for r in range(n) if prefix_items[r] is not None
+                ]
+                has_prefix = len(cand_item_tensors) > 0
 
-            topk = min(max(KEYS), cand_items.shape[0])
-            topk_idx = logits.topk(topk, largest=True)[1]  # [topk]
-            topk_items = cand_items[topk_idx]  # [topk] 0-based item indices
+                # ---- Standard (prefix items only) ----
+                if not has_prefix:
+                    for key in KEYS:
+                        recall_dict[n][key].append(0.0)
+                        ndcg_dict[n][key].append(0.0)
+                else:
+                    cand_items = torch.unique(torch.cat(cand_item_tensors))  # [n_cand]
 
-            matches = (topk_items == target_item)  # [topk] bool
-            for key in KEYS:
-                recall_dict[key].append(matches[:key].any().float().item())
-                ndcg_dict[key].append(ndcg_at_k_torch(matches, key).item())
+                    # dense retrieval: rank the candidate items by similarity to pred_emb
+                    cand_emb = item_embedding[cand_items]  # [n_cand, n_embd]
+                    _, logits = get_target_embed(
+                        pred_emb[None], model, method_config, cand_emb
+                    )  # [1, n_cand]
+                    logits = logits[0]  # [n_cand]
 
-    return recall_dict, ndcg_dict
+                    topk = min(max(KEYS), cand_items.shape[0])
+                    topk_idx = logits.topk(topk, largest=True)[1]  # [topk]
+                    topk_items = cand_items[topk_idx]  # [topk] 0-based item indices
+
+                    matches = (topk_items == target_item)  # [topk] bool
+                    for key in KEYS:
+                        recall_dict[n][key].append(matches[:key].any().float().item())
+                        ndcg_dict[n][key].append(ndcg_at_k_torch(matches, key).item())
+
+                # ---- AddCold (prefix items ∪ cold-start items, deduplicated) ----
+                if add_cold_items is not None:
+                    if has_prefix:
+                        # cand_items already computed above
+                        cand_items_cold = torch.unique(
+                            torch.cat([cand_items, add_cold_items])
+                        )
+                    else:
+                        cand_items_cold = add_cold_items
+
+                    cand_emb_cold = item_embedding[cand_items_cold]
+                    _, logits_cold = get_target_embed(
+                        pred_emb[None], model, method_config, cand_emb_cold
+                    )
+                    logits_cold = logits_cold[0]
+
+                    topk_cold = min(max(KEYS), cand_items_cold.shape[0])
+                    topk_idx_cold = logits_cold.topk(topk_cold, largest=True)[1]
+                    topk_items_cold = cand_items_cold[topk_idx_cold]
+
+                    matches_cold = (topk_items_cold == target_item)
+                    for key in KEYS:
+                        recall_dict_cold[n][key].append(
+                            matches_cold[:key].any().float().item()
+                        )
+                        ndcg_dict_cold[n][key].append(
+                            ndcg_at_k_torch(matches_cold, key).item()
+                        )
+
+    return recall_dict, ndcg_dict, recall_dict_cold, ndcg_dict_cold
+
+
+@torch.no_grad()
+def evaluate_layer_accuracy(
+    model,
+    dataloader,
+    device,
+    method_config,
+    KEYS=[10],
+    num_beams=None,
+):
+    """
+    Per-layer SID accuracy analysis via beam search.
+
+    Generates all ``n_codebook`` SID tokens in a single beam search, then
+    analyzes the beam candidates at each depth *k* = 1, 2, …, n_codebook.
+
+    For each depth *k*:
+      - **Layer_k_Recall@K** (cumulative): fraction of samples where at least
+        one of the top-K beam candidates has its first *k* SIDs matching the
+        ground-truth's first *k* SIDs.
+      - **Layer_k_NDCG@K**  (cumulative): NDCG@K computed on the binary
+        relevance vector (match / no-match of the first *k* SIDs) over the
+        top-K beam candidates.
+      - **Layer_k_Acc** (conditional): probability that the *k*-th SID is
+        correct **given** the first *(k-1)* SIDs are correct.  Formally::
+
+            Layer_k_Acc = N(samples correct up to k) / N(samples correct up to k-1)
+
+        For k = 1 there is no prefix condition, so Layer_1_Acc = Layer_1_Recall@K.
+
+    These metrics together reveal where the hierarchical SID decoding
+    bottleneck lies: a large drop in Layer_k_Acc at a particular layer
+    indicates that the model struggles to predict that layer even when all
+    preceding layers are correct.
+
+    :param KEYS: recall / NDCG cutoff(s).  Default ``[10]``.
+    :param num_beams: beam width.  Defaults to ``max(KEYS)``.
+    :return: dict mapping metric names to scalar values, plus a ``raw`` dict
+             with per-sample arrays for further analysis.
+    """
+    model.eval()
+
+    key = KEYS[0]  # primary cutoff (e.g. 10)
+    if num_beams is None:
+        num_beams = max(KEYS)
+
+    # Accumulate per-sample binary matches at each depth
+    layer_matches = {}   # depth k -> list[float] (0 or 1)
+    layer_ndcg = {}      # depth k -> list[float]
+    n_codebook_global = None
+
+    for batch in tqdm(dataloader, desc="Layer-wise SID Evaluation"):
+        labels = batch["labels_sids"].to(device)
+        batch_size, n_codebook = labels.shape[0], labels.shape[1]
+        n_codebook_global = n_codebook
+
+        with torch.no_grad():
+            _, input_kwargs = model_forward(
+                model, batch, device, n_codebook, method_config, skip_forward=True
+            )
+
+        gen_kwargs = {
+            "num_beams": num_beams,
+            "max_new_tokens": n_codebook,
+            "num_return_sequences": num_beams,
+            "use_cache": True,
+        }
+        with torch.amp.autocast(device_type="cuda", dtype=torch.float16):
+            outputs = model.generate(**input_kwargs, **gen_kwargs)
+
+        # Drop decoder-start token -> [B, num_beams, n_codebook]
+        outputs = outputs[:, 1 : 1 + n_codebook].reshape(
+            batch_size, num_beams, -1
+        )
+        # Pad with zeros if the model emitted EOS early
+        if outputs.shape[-1] < n_codebook:
+            to_pad = n_codebook - outputs.shape[-1]
+            pad_tensor = torch.zeros(
+                (batch_size, num_beams, to_pad), device=outputs.device,
+                dtype=outputs.dtype,
+            )
+            outputs = torch.cat([outputs, pad_tensor], dim=-1)
+
+        # Analyze at each depth k = 1 .. n_codebook
+        for k in range(1, n_codebook + 1):
+            # [B, num_beams] — does candidate's first k SIDs match?
+            match_k = (
+                outputs[:, :, :k] == labels[:, None, :k]
+            ).all(dim=-1)  # [B, num_beams]
+
+            # Recall@key: any match among top-key candidates
+            any_match = match_k[:, :key].any(dim=-1).float()  # [B]
+
+            # NDCG@key per sample
+            ndcg_vals = [
+                ndcg_at_k_torch(match_k[b], key).item() for b in range(batch_size)
+            ]
+
+            layer_matches.setdefault(k, []).extend(any_match.tolist())
+            layer_ndcg.setdefault(k, []).extend(ndcg_vals)
+
+    # ---- Aggregate ----
+    results = {}
+    raw = {}
+    for k in range(1, n_codebook_global + 1):
+        mk = np.array(layer_matches[k])
+        nk = np.array(layer_ndcg[k])
+
+        recall_k = float(mk.mean())
+        ndcg_k = float(nk.mean())
+
+        results[f"Layer_{k}_Recall@{key}"] = recall_k
+        results[f"Layer_{k}_NDCG@{key}"] = ndcg_k
+
+        if k == 1:
+            acc_k = recall_k  # no prefix condition
+        else:
+            n_correct_prev = int(np.array(layer_matches[k - 1]).sum())
+            n_correct_k = int(mk.sum())
+            acc_k = (
+                n_correct_k / n_correct_prev
+                if n_correct_prev > 0
+                else 0.0
+            )
+
+        results[f"Layer_{k}_Acc"] = acc_k
+        raw[f"Layer_{k}_matches"] = mk.tolist()
+        raw[f"Layer_{k}_ndcg"] = nk.tolist()
+
+    return results, raw

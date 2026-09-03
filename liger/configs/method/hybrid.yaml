@@ -25,24 +25,34 @@ use_extra_sid: False
 # The generative model only predicts the first `prefix_depth` sids.
 # Valid values: 2 or 3 (must be <= n_semantic_codebook).
 prefix_depth: 2
+# Number of SID layers used to represent each input item in the encoder
+# sequence. Set to prefix_depth so the encoder only sees the prefix SIDs it
+# is trained to predict — finer-grained SIDs are left to the dense retriever.
+# Set to 0 to use all n_codebook SIDs.
+input_sid_depth: 2
 # Number of beam prefixes generated per sample at evaluation time; the dense
-# retriever ranks the union of their prefix buckets. Larger -> denser retrieval
-# has a bigger candidate pool to rank (closer to the liger 100-candidate setup).
-hybrid_num_candidates: 100
-# Dense loss negative sampling:
-#   "full"   (default, liger-style): project every seen item, softmax over the
-#            whole library. Strong retrieval signal, ~500MB-1GB activation per
-#            step. Use this when dense quality matters more than speed.
-#   "bucket" (ablation): only rank items inside the target's prefix bucket.
-#            Fast and train/eval-aligned, but weak negatives -> dense head under-
-#            trains. Kept for experiments.
+# retriever ranks the union of their prefix buckets. A list evaluates with each
+# candidate count, producing Gen{n}_Recall@K metrics comparable to Liger's
+# generate_then_dense. Each value must be >= max(KEYS).
+hybrid_num_candidates: [20, 40, 60, 80, 100]
+# Dense loss negative sampling (controls the MAIN dense loss only):
+#   "full"      (default, liger-style): project every seen item, softmax over the
+#               whole library. Strong retrieval signal, ~500MB-1GB activation per
+#               step. Use this when dense quality matters more than speed.
+#   "in_batch" (ablation): only the B target items in the batch are projected;
+#               positives = own target, negatives = other B-1 batch targets.
+#               Much cheaper, weaker signal.
+#   "bucket"   (ablation): only items in the target's prefix bucket.
+#               Train/eval-aligned but weak negatives.
 dense_loss_mode: "full"
-# Auxiliary bucket contrastive loss weight. On top of the full-library dense
-# loss, adds a bucket-only CE that aligns the dense head with the evaluation
-# candidate set (eval ranks items inside the target's prefix bucket). Set to 0
-# to disable; set to 1.0 to give it equal weight with the full-library loss.
-# Check `train/bucket_loss` vs `train/embedding_loss` on wandb to tune.
-bucket_loss_weight: 0.0
+# Auxiliary bucket contrastive loss weight. On top of the main dense loss
+# (controlled by dense_loss_mode above), adds a bucket-only CE that aligns the
+# dense head with the evaluation candidate set (eval ranks items inside the
+# target's prefix bucket). Independent of dense_loss_mode — e.g. set
+# dense_loss_mode=in_batch + bucket_loss_weight=4.0 for batch InfoNCE + bucket
+# alignment. Set to 0 to disable. Check `train/bucket_loss` vs
+# `train/embedding_loss` on wandb to tune.
+bucket_loss_weight: 4.0
 
 # Similarity metric for dense retrieval (training + evaluation):
 #   "cosine" (default) — L2-normalize both predicted and item embeddings,

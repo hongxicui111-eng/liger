@@ -183,16 +183,33 @@ def main(config: DictConfig) -> None:
                 #                        scratch, like original SASRec.
                 fusion_mode = sasrec_cfg.get("fusion_mode", "fused")
 
-                # L2-normalize semantic embeddings before fusion (optional).
-                # When using dot-product similarity in SASRec, raw semantic
-                # norm ≈ 27.7 makes dot products explode → loss diverges.
-                # Normalizing to unit norm keeps dot-product scale ~O(1).
-                # When using cosine similarity, normalization happens inside
-                # the model, so pre-normalization is optional (but harmless).
+                # Fusion method: how the semantic embedding is transformed
+                # before being added to CF (only relevant when fusion_mode="fused").
+                #   "normalize" (default) — L2-normalize semantic, then add CF.
+                #                          Requires normalize_semantic for scale control.
+                #   "mlp"               — Pass semantic through a learnable Linear
+                #                          layer, then add CF. No pre-normalization
+                #                          needed; the projection learns the optimal
+                #                          scale/rotation. hidden_units can differ
+                #                          from the semantic embedding dimension.
+                fusion_method = sasrec_cfg.get("fusion_method", "normalize")
+
+                # L2-normalize semantic embeddings before fusion (only used
+                # when fusion_method="normalize"). When using dot-product
+                # similarity, raw semantic norm ≈ 27.7 makes dot products
+                # explode → loss diverges. Normalizing to unit norm keeps
+                # dot-product scale ~O(1). With fusion_method="mlp", the
+                # learnable projection handles scaling, so normalization is
+                # skipped.
                 normalize_semantic = sasrec_cfg.get("normalize_semantic", True)
 
                 if fusion_mode == "fused":
-                    if normalize_semantic:
+                    if fusion_method == "mlp":
+                        # MLP mode: pass raw semantic embeddings (no normalization).
+                        # The learnable Linear layer handles scaling/rotation.
+                        sem_normed = item_embedding
+                        print(f"  fusion_method=mlp: raw semantic → Linear → + CF")
+                    elif normalize_semantic:
                         sem_normed = item_embedding / item_embedding.norm(
                             dim=-1, keepdim=True).clamp(min=1e-8)
                     else:
@@ -210,7 +227,7 @@ def main(config: DictConfig) -> None:
                 print(f"\nTraining SASRec [{fusion_mode}] ...")
                 print(f"  num_items={num_items}, hidden_units={item_embedding.shape[1]}")
                 if sem_with_pad is not None:
-                    print(f"  normalize_semantic={normalize_semantic}")
+                    print(f"  fusion_method={fusion_method}, normalize_semantic={normalize_semantic}")
 
                 # Set up a wandb run for SASRec training
                 from utils import setup_logging
@@ -243,6 +260,7 @@ def main(config: DictConfig) -> None:
                     temperature=sasrec_cfg.get("temperature", 1.0),
                     writer=sasrec_writer,
                     eval_sequences=user_sequence,
+                    fusion_method=fusion_method,
                 )
                 sasrec_writer.finish()
                 # Load fused embeddings for RQ-VAE quantization
@@ -253,6 +271,20 @@ def main(config: DictConfig) -> None:
                 fused_embedding = torch.load(fused_path, weights_only=False).to(device)
 
             print(f"Using fused embeddings for quantization: {fused_embedding.shape}")
+
+            # Whether to stop the entire pipeline after SASRec training.
+            # Useful when you only want to inspect SASRec training quality
+            # (Recall@10/NDCG@10, loss curves) without proceeding to the
+            # expensive RQ-VAE quantization and TIGER training stages.
+            stop_after_sasrec = sasrec_cfg.get("stop_after_sasrec", False)
+            if stop_after_sasrec:
+                print("\n" + "=" * 60)
+                print("stop_after_sasrec=true — pipeline halted after SASRec.")
+                print(f"  Fused embeddings saved to: {fused_path}")
+                print(f"  Shape: {fused_embedding.shape}")
+                print("=" * 60)
+                return
+
         else:
             fused_embedding = item_embedding
 

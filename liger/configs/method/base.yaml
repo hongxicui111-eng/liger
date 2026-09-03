@@ -10,6 +10,25 @@ use_extra_sid: True
 #               0 means "predict all n_codebook sids" (backward compatible).
 #               Set to 2 or 3 for the hybrid method (generative prefix -> dense).
 prefix_depth: 0
+# input_sid_depth: number of SID layers used to represent each input item in the
+#                  encoder sequence. 0 (default) = use all n_codebook SIDs per
+#                  item (backward compatible). A positive integer N truncates
+#                  each input item to its first N SIDs, shortening the encoder
+#                  sequence and discarding fine-grained quantization noise.
+#                  Typically set equal to prefix_depth so the encoder only sees
+#                  the SIDs it is trained to predict.
+input_sid_depth: 0
+# dense_loss_mode: how the MAIN dense retrieval loss picks negatives.
+#   "full"      (default, liger original): full-library softmax over all seen
+#                items. Strong global signal, ~500MB-1GB activation per step.
+#   "in_batch"  (ablation): only the B target items in the batch are projected;
+#                positives = own target, negatives = other B-1 batch targets.
+#                Much cheaper, weaker signal. Used for the liger in-batch ablation.
+#   "bucket"    (hybrid ablation): only items in the target's prefix bucket.
+#                Train/eval-aligned but weak negatives.
+# An auxiliary bucket CE (bucket_loss_weight) can be added on top of any mode —
+# see hybrid.yaml for details.
+dense_loss_mode: "full"
 
 # model training
 flag_add_input_embedding: False
