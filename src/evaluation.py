@@ -14,6 +14,41 @@ from tqdm import tqdm
 from transformers import LogitsProcessor, LogitsProcessorList
 
 
+# ── 分组评测工具 ─────────────────────────────────────────────────────────────
+
+# 用户活跃度分组边界（训练序列长度，左闭右闭）
+USER_GROUP_EDGES  = [3, 4, 6, 11]          # cold=3, low=4-5, medium=6-10, heavy>=11
+USER_GROUP_LABELS = ["cold", "low", "medium", "heavy"]
+
+# 物品流行度分组边界（训练集出现次数，左闭右闭）
+ITEM_GROUP_EDGES  = [1, 5, 10, 20]         # cold=1-4, low=5-9, medium=10-19, hot>=20
+ITEM_GROUP_LABELS = ["cold", "low", "medium", "hot"]
+
+
+def get_user_group(seq_len: int) -> str:
+    """根据训练序列长度返回用户分组名称。"""
+    for i in range(len(USER_GROUP_EDGES) - 1, -1, -1):
+        if seq_len >= USER_GROUP_EDGES[i]:
+            return USER_GROUP_LABELS[i]
+    return USER_GROUP_LABELS[0]
+
+
+def get_item_group(freq: int) -> str:
+    """根据物品在训练集中的出现次数返回物品分组名称。"""
+    for i in range(len(ITEM_GROUP_EDGES) - 1, -1, -1):
+        if freq >= ITEM_GROUP_EDGES[i]:
+            return ITEM_GROUP_LABELS[i]
+    return ITEM_GROUP_LABELS[0]
+
+
+def empty_group_dict(KEYS):
+    """初始化分组 recall/ndcg 字典。"""
+    d = {}
+    for grp in USER_GROUP_LABELS + ITEM_GROUP_LABELS:
+        d[grp] = {k: [] for k in KEYS}
+    return d
+
+
 def model_forward(model, batch, device, n_codebook, method_config, skip_forward=False):
     if method_config["use_id"] == "sid":
         input_sids = batch["input_sids"].to(device)
@@ -253,6 +288,7 @@ def evaluate(
     method_config,
     KEYS,
     RETRIEVE_KEY,
+    item_freq_arr=None,   # shape [n_items]，item_freq_arr[item_id-1] = 训练集出现次数
 ):
 
     model.eval()
@@ -260,8 +296,14 @@ def evaluate(
     returned_cand = []
     returned_predicted_embedding = []
 
+    # 分组 recall 容器（仅在 item_freq_arr 传入时启用）
+    group_recall_user = empty_group_dict(KEYS)  # 按用户活跃度分组
+    group_recall_item = empty_group_dict(KEYS)  # 按物品流行度分组
+    do_group_eval = item_freq_arr is not None
+
     for batch in tqdm(dataloader):
         labels = batch["labels_sids"].to(device)
+        label_item_ids = batch["labels_ids"][:, 0].cpu().numpy()  # [B]，1-indexed
 
         with torch.no_grad():
             _, input_kwargs = model_forward(
@@ -277,6 +319,11 @@ def evaluate(
             labels.shape[0],
             labels.shape[1],
         )  # this batch_size is before ddp
+
+        # 计算用户训练序列长度（attention_mask_ids 非零数量 - 1，排除 label token）
+        if do_group_eval:
+            attn_mask = batch["attention_mask_ids"].cpu().numpy()  # [B, seq_len]
+            user_seq_lens = attn_mask.sum(axis=1).astype(int)      # [B]
 
         num_return_sequences = max(RETRIEVE_KEY)
         num_beams = max(RETRIEVE_KEY)
@@ -304,9 +351,6 @@ def evaluate(
         # along the num_return_sequences, all the outputs are the same
 
         if outputs.shape[-1] < n_codebook:
-            # if output shape is smaller than label shape, pad with zeros to label shape
-            # can happen when the LM predicts eos early
-            # if padded with zero, the remaining prediction should measure the recall / ndcg as 0.
             to_pad = n_codebook - outputs.shape[-1]
             pad_tensor = torch.zeros(
                 (batch_size, gen_kwargs["num_return_sequences"], to_pad),
@@ -314,7 +358,6 @@ def evaluate(
             )
             outputs = torch.cat([outputs, pad_tensor], dim=-1)
 
-        outputs = outputs
         returned_cand.extend(outputs)
 
         _recall_at_i, _ndcg_at_i = calculate_metrics(
@@ -330,7 +373,23 @@ def evaluate(
             recall_dict[key].extend(_recall_at_i[key])
             ndcg_dict[key].extend(_ndcg_at_i[key])
 
-    return recall_dict, ndcg_dict, returned_cand, returned_predicted_embedding
+        # ── 分组收集 ──────────────────────────────────────────────────────
+        if do_group_eval:
+            for b in range(batch_size):
+                item_id   = int(label_item_ids[b])
+                item_freq = int(item_freq_arr[item_id - 1])
+                seq_len   = int(user_seq_lens[b])
+
+                u_grp = get_user_group(seq_len)
+                i_grp = get_item_group(item_freq)
+
+                for k in KEYS:
+                    hit = float(_recall_at_i[k][b])
+                    group_recall_user[u_grp][k].append(hit)
+                    group_recall_item[i_grp][k].append(hit)
+
+    return recall_dict, ndcg_dict, returned_cand, returned_predicted_embedding, \
+           group_recall_user, group_recall_item
 
 
 def get_target_embed(predicted_embedding, model, method_config, item_embedding):

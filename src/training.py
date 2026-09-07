@@ -22,6 +22,8 @@ from transformers.optimization import get_scheduler
 from utils import CustomDataset, get_lr, setup_logging
 
 from .evaluation import (
+    USER_GROUP_LABELS,
+    ITEM_GROUP_LABELS,
     evaluate,
     evaluate_dense_ids,
     evaluate_dense_sids,
@@ -31,6 +33,20 @@ from .evaluation import (
 )
 from .load_data import load_data
 from .tiger import TIGER
+
+
+def _log_group_results(logs, group_recall, group_labels, dim_name, prefix, KEYS):
+    """将分组 recall 均值写入 logs，并打印到终端。"""
+    print(f"\n  [{prefix} / {dim_name} group breakdown]")
+    for grp in group_labels:
+        for k in KEYS:
+            vals = group_recall[grp][k]
+            if len(vals) == 0:
+                continue
+            mean_val = float(np.mean(vals))
+            log_key = f"{prefix}/{dim_name}_group_{grp}/Recall@{k}"
+            logs[log_key] = torch.tensor(mean_val)
+            print(f"    {grp:8s}  Recall@{k} = {mean_val:.4f}  (n={len(vals)})")
 
 
 def evaluate_helper(
@@ -45,10 +61,12 @@ def evaluate_helper(
     keyword="eval",
     KEYS=[10],  # recall@k, k list
     RETRIEVE_KEY=[20, 40, 60, 80, 100],  # retrieve then rank
+    item_freq_arr=None,  # shape [n_items]，仅 test 阶段传入，用于分组评测
 ):
     """
     :param KEYS: the keys for the recall@k
     :param RETRIEVE_KEY: the keys for the retrieve then rank, only used for liger
+    :param item_freq_arr: item frequency array for grouped evaluation (test only)
     """
 
     model.eval()
@@ -60,7 +78,9 @@ def evaluate_helper(
 
     def _evaluate(logs, dataloader, name):
         if method_config["sid_loss_weight"] > 0:
-            recall_dict, ndcg_dict, returned_cand, returned_embd = evaluate(
+            _item_freq = item_freq_arr if "test" in keyword else None
+            recall_dict, ndcg_dict, returned_cand, returned_embd, \
+                group_recall_user, group_recall_item = evaluate(
                 model,
                 dataloader,
                 all_semantic_ids,
@@ -68,10 +88,16 @@ def evaluate_helper(
                 method_config=method_config,
                 KEYS=KEYS,
                 RETRIEVE_KEY=RETRIEVE_KEY,
+                item_freq_arr=_item_freq,
             )
             for key in recall_dict.keys():
                 logs = add_log(logs, recall_dict[key], f"Recall@{key}", name)
                 logs = add_log(logs, ndcg_dict[key], f"NDCG@{key}", name)
+
+            # 分组结果写入 logs（仅 test 阶段）
+            if _item_freq is not None:
+                _log_group_results(logs, group_recall_user, USER_GROUP_LABELS, "user", name, KEYS)
+                _log_group_results(logs, group_recall_item, ITEM_GROUP_LABELS, "item", name, KEYS)
         else:
             returned_cand = None
             returned_embd = None
@@ -334,6 +360,19 @@ def train_tiger(
         axis=0,
     )  # [n_items, n_code]
 
+    # 构建物品频次数组，用于 test 阶段分组评测
+    # item id 从 1 开始，item_freq_arr[item_id-1] = 训练集出现次数
+    from collections import Counter as _Counter
+    _item_counter = _Counter()
+    for seq in user_sequence:
+        for item in seq[:-2]:   # 去掉 val + test 的最后两个 item
+            _item_counter[item] += 1
+    n_items = item2sid.shape[0]
+    item_freq_arr = np.zeros(n_items, dtype=np.int32)
+    for item_id, freq in _item_counter.items():
+        if 1 <= item_id <= n_items:
+            item_freq_arr[item_id - 1] = freq
+
     # deal with the output embedding
     if method_config["flag_use_output_embedding"]:
         item_embedding = item_embedding.to(device)
@@ -593,6 +632,7 @@ def train_tiger(
         method_config,
         keyword="test",
         RETRIEVE_KEY=RETRIEVE_KEY,
+        item_freq_arr=item_freq_arr,
     )
 
     writer.log(logs)
